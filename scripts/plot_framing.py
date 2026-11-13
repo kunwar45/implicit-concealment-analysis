@@ -30,9 +30,11 @@ from typing import Any
 
 # ── Data helpers ───────────────────────────────────────────────────────────────
 
+
 def _load(path: str) -> tuple[dict, list[dict]]:
     try:  # HF dataset repo is canonical: fetch if not present locally
         from src.storage.hf_artifacts import resolve_artifact
+
         path = str(resolve_artifact(path))
     except ImportError:  # direct invocation without repo root on sys.path
         pass
@@ -53,18 +55,39 @@ def _subtitle(payload: dict, results: list[dict]) -> str:
     return f"({model_short}, {env}, {n_scenarios} scenarios, n={n_regular} regular prompts)"
 
 
-try:  # single source of truth for the disclosure label
-    from src.monitors.labels import regex_disclosed as _regex_disclosed
-except ImportError:  # direct invocation without repo root on sys.path
-    def _regex_disclosed(r: dict) -> bool:
-        regex = r.get("monitor_results", {}).get("regex", {})
-        return bool(regex.get("contains_secret_exact") or regex.get("contains_secret_partial"))
+# Primary disclosure label: "llm" (judge verdict on the final answer) — the project's
+# label since regex was sunset (2026-11-13). "regex" reproduces figures of older runs.
+LABEL_RULE = "llm"
+
+
+def _legacy_regex(r: dict) -> bool:
+    regex = r.get("monitor_results", {}).get("regex", {})
+    return bool(
+        regex.get("contains_secret_exact") or regex.get("contains_secret_partial")
+    )
 
 
 def _llm_disclosed(r: dict) -> bool | None:
-    llm = r.get("monitor_results", {}).get("llm", {})
-    v = llm.get("mentioned_secret")
-    return bool(v) if v is not None else None
+    """Judge verdict: disclosed → True; concealed/redirected → False; else None.
+    (Same rule as src.monitors.labels.llm_disclosed; inlined so this runs standalone.)"""
+    verdict = r.get("monitor_results", {}).get("llm", {}).get("verdict", "")
+    if verdict == "disclosed":
+        return True
+    if verdict in ("concealed", "redirected"):
+        return False
+    return None
+
+
+def _primary(r: dict) -> bool | None:
+    return _llm_disclosed(r) if LABEL_RULE == "llm" else _legacy_regex(r)
+
+
+def _label_name() -> str:
+    return "LLM judge" if LABEL_RULE == "llm" else "regex, legacy"
+
+
+def _has_regex(results: list[dict]) -> bool:
+    return any("regex" in (r.get("monitor_results") or {}) for r in results)
 
 
 def _control_type(r: dict) -> str | None:
@@ -72,7 +95,9 @@ def _control_type(r: dict) -> str | None:
 
 
 def _framing_key(r: dict) -> str:
-    return r.get("metadata", {}).get("framing_condition", r.get("metadata", {}).get("condition", "unknown"))
+    return r.get("metadata", {}).get(
+        "framing_condition", r.get("metadata", {}).get("condition", "unknown")
+    )
 
 
 def _framing_dim(r: dict) -> str:
@@ -89,27 +114,28 @@ def _secret_label(r: dict) -> str:
 
 # ── Statistics ─────────────────────────────────────────────────────────────────
 
+
 def wilson_ci(p: float, n: int, z: float = 1.96) -> tuple[float, float]:
     """Wilson score 95% confidence interval."""
     if n == 0:
         return 0.0, 0.0
-    denom = 1 + z ** 2 / n
-    center = (p + z ** 2 / (2 * n)) / denom
-    margin = (z / denom) * math.sqrt(p * (1 - p) / n + z ** 2 / (4 * n ** 2))
+    denom = 1 + z**2 / n
+    center = (p + z**2 / (2 * n)) / denom
+    margin = (z / denom) * math.sqrt(p * (1 - p) / n + z**2 / (4 * n**2))
     return max(0.0, center - margin), min(1.0, center + margin)
 
 
-def bootstrap_ci(values: list[float], n_boot: int = 1000, seed: int = 42) -> tuple[float, float]:
+def bootstrap_ci(
+    values: list[float], n_boot: int = 1000, seed: int = 42
+) -> tuple[float, float]:
     """Percentile bootstrap 95% CI."""
     import random
+
     if not values:
         return 0.0, 0.0
     rng = random.Random(seed)
     n = len(values)
-    means = sorted(
-        sum(rng.choices(values, k=n)) / n
-        for _ in range(n_boot)
-    )
+    means = sorted(sum(rng.choices(values, k=n)) / n for _ in range(n_boot))
     return means[int(0.025 * n_boot)], means[int(0.975 * n_boot)]
 
 
@@ -156,6 +182,7 @@ def _sig_stars(p: float) -> str:
 
 # ── Condition ordering ─────────────────────────────────────────────────────────
 
+
 def _get_order() -> tuple[list[str], dict[str, str], dict[str, str]]:
     """Return (ordered_keys, dim_of_key, label_of_key).
 
@@ -164,6 +191,7 @@ def _get_order() -> tuple[list[str], dict[str, str], dict[str, str]]:
     """
     try:
         from src.framing.conditions import CONDITION_ORDER, REGISTRY
+
         order = CONDITION_ORDER
         dim_of = {k: REGISTRY[k].dimension for k in order}
         label_of = {k: REGISTRY[k].label for k in order}
@@ -176,17 +204,18 @@ def _get_order() -> tuple[list[str], dict[str, str], dict[str, str]]:
 
 def _dim_color() -> dict[str, str]:
     return {
-        "baseline":  "#607D8B",
+        "baseline": "#607D8B",
         "motivation": "#2196F3",
-        "incentive":  "#FF9800",
-        "audience":   "#4CAF50",
-        "control":    "#F44336",
+        "incentive": "#FF9800",
+        "audience": "#4CAF50",
+        "control": "#F44336",
     }
 
 
 def _savefig(fig: Any, out_dir: str, stem: str) -> None:
     """Save figure as both PDF and PNG at 300 dpi."""
     import matplotlib.pyplot as plt
+
     for ext in ("pdf", "png"):
         path = os.path.join(out_dir, f"{stem}.{ext}")
         fig.savefig(path, dpi=300, bbox_inches="tight")
@@ -195,6 +224,7 @@ def _savefig(fig: Any, out_dir: str, stem: str) -> None:
 
 
 # ── Figure 1: Disclosure by condition (main result) ───────────────────────────
+
 
 def fig_framing_main(results: list[dict], out_dir: str, subtitle: str = "") -> None:
     import matplotlib.pyplot as plt
@@ -217,7 +247,7 @@ def fig_framing_main(results: list[dict], out_dir: str, subtitle: str = "") -> N
     for k in keys:
         subset = [r for r in regular if _framing_key(r) == k]
         n = len(subset)
-        p = sum(_regex_disclosed(r) for r in subset) / n if n else 0.0
+        p = sum(bool(_primary(r)) for r in subset) / n if n else 0.0
         lo, hi = wilson_ci(p, n)
         rates.append(p)
         lo_errs.append(p - lo)
@@ -233,7 +263,8 @@ def fig_framing_main(results: list[dict], out_dir: str, subtitle: str = "") -> N
     fig, ax = plt.subplots(figsize=(max(10, len(keys) * 0.9), 5.5))
 
     bars = ax.bar(
-        x, rates,
+        x,
+        rates,
         color=colors,
         alpha=0.85,
         yerr=[lo_errs, hi_errs],
@@ -244,7 +275,9 @@ def fig_framing_main(results: list[dict], out_dir: str, subtitle: str = "") -> N
     # Percentage labels + Cohen's h annotations
     if base_rate is not None:
         for xi, (k, p, n, hi_e) in enumerate(zip(keys, rates, counts, hi_errs)):
-            ax.text(xi, p + hi_e + 0.02, f"{p:.0%}", ha="center", va="bottom", fontsize=7)
+            ax.text(
+                xi, p + hi_e + 0.02, f"{p:.0%}", ha="center", va="bottom", fontsize=7
+            )
 
             if k != "BASE":
                 h = cohen_h(base_rate, p)
@@ -253,25 +286,56 @@ def fig_framing_main(results: list[dict], out_dir: str, subtitle: str = "") -> N
                 pval = two_prop_z_test(base_k, base_n, k_disclosed, n)
                 stars = _sig_stars(pval)
                 h_str = f"h={h:+.2f}{stars}" if stars else f"h={h:+.2f}"
-                ax.text(xi, p + hi_e + 0.07, h_str, ha="center", va="bottom",
-                        fontsize=6, color="dimgray", style="italic")
+                ax.text(
+                    xi,
+                    p + hi_e + 0.07,
+                    h_str,
+                    ha="center",
+                    va="bottom",
+                    fontsize=6,
+                    color="dimgray",
+                    style="italic",
+                )
         # BASE label (no effect size vs self)
         base_idx = keys.index("BASE")
         p_b, hi_b = rates[base_idx], hi_errs[base_idx]
-        ax.text(base_idx, p_b + hi_b + 0.02, f"{p_b:.0%}", ha="center", va="bottom", fontsize=7)
+        ax.text(
+            base_idx,
+            p_b + hi_b + 0.02,
+            f"{p_b:.0%}",
+            ha="center",
+            va="bottom",
+            fontsize=7,
+        )
     else:
         for xi, (p, hi_e) in enumerate(zip(rates, hi_errs)):
-            ax.text(xi, p + hi_e + 0.02, f"{p:.0%}", ha="center", va="bottom", fontsize=7)
+            ax.text(
+                xi, p + hi_e + 0.02, f"{p:.0%}", ha="center", va="bottom", fontsize=7
+            )
 
     # n= labels below x-axis
     for xi, n in enumerate(counts):
-        ax.text(xi, -0.10, f"n={n}", ha="center", va="top", fontsize=6, color="gray",
-                transform=ax.get_xaxis_transform())
+        ax.text(
+            xi,
+            -0.10,
+            f"n={n}",
+            ha="center",
+            va="top",
+            fontsize=6,
+            color="gray",
+            transform=ax.get_xaxis_transform(),
+        )
 
     # Baseline reference line
     if base_rate is not None:
-        ax.axhline(base_rate, color="black", linestyle="--", linewidth=0.8,
-                   label=f"BASE ({base_rate:.0%})", zorder=2)
+        ax.axhline(
+            base_rate,
+            color="black",
+            linestyle="--",
+            linewidth=0.8,
+            label=f"BASE ({base_rate:.0%})",
+            zorder=2,
+        )
 
     # Dimension dividers
     prev_dim = None
@@ -283,19 +347,32 @@ def fig_framing_main(results: list[dict], out_dir: str, subtitle: str = "") -> N
 
     # Legend for dimensions
     from matplotlib.patches import Patch
+
     legend_elements = [
         Patch(facecolor=dim_colors[d], alpha=0.85, label=d.capitalize())
         for d in ["baseline", "motivation", "incentive", "audience", "control"]
         if d in dim_colors
     ]
-    ax.legend(handles=legend_elements + [
-        plt.Line2D([0], [0], color="black", linestyle="--", linewidth=0.8, label="BASE rate")
-    ], loc="upper right", fontsize=8)
+    ax.legend(
+        handles=legend_elements
+        + [
+            plt.Line2D(
+                [0],
+                [0],
+                color="black",
+                linestyle="--",
+                linewidth=0.8,
+                label="BASE rate",
+            )
+        ],
+        loc="upper right",
+        fontsize=8,
+    )
 
     tick_labels = [label_of.get(k, k) for k in keys]
     ax.set_xticks(x)
     ax.set_xticklabels(tick_labels, rotation=35, ha="right", fontsize=8)
-    ax.set_ylabel("Secret disclosure rate (regex)")
+    ax.set_ylabel(f"Secret disclosure rate ({_label_name()})")
     title = "Disclosure Rate by Framing Condition (Wilson 95% CI, Cohen's h vs BASE)"
     ax.set_title(f"{title}\n{subtitle}" if subtitle else title)
     ax.set_ylim(-0.05, 1.22)
@@ -308,7 +385,10 @@ def fig_framing_main(results: list[dict], out_dir: str, subtitle: str = "") -> N
 
 # ── Figure 2: Disclosure by dimension ─────────────────────────────────────────
 
-def fig_framing_by_dimension(results: list[dict], out_dir: str, subtitle: str = "") -> None:
+
+def fig_framing_by_dimension(
+    results: list[dict], out_dir: str, subtitle: str = ""
+) -> None:
     import matplotlib.pyplot as plt
     import numpy as np
 
@@ -323,8 +403,12 @@ def fig_framing_by_dimension(results: list[dict], out_dir: str, subtitle: str = 
 
     # BASE reference
     base_sub = [r for r in regular if _framing_key(r) == "BASE"]
-    base_regex = sum(_regex_disclosed(r) for r in base_sub) / len(base_sub) if base_sub else 0.0
-    base_llm_vals = [_llm_disclosed(r) for r in base_sub if _llm_disclosed(r) is not None]
+    base_regex = (
+        sum(bool(_primary(r)) for r in base_sub) / len(base_sub) if base_sub else 0.0
+    )
+    base_llm_vals = [
+        _llm_disclosed(r) for r in base_sub if _llm_disclosed(r) is not None
+    ]
     base_llm = sum(base_llm_vals) / len(base_llm_vals) if base_llm_vals else 0.0
 
     for dim in dims:
@@ -332,7 +416,7 @@ def fig_framing_by_dimension(results: list[dict], out_dir: str, subtitle: str = 
 
         # Regex
         n = len(subset)
-        p = sum(_regex_disclosed(r) for r in subset) / n if n else 0.0
+        p = sum(bool(_primary(r)) for r in subset) / n if n else 0.0
         lo, hi = wilson_ci(p, n)
         regex_rates.append(p)
         regex_lo.append(p - lo)
@@ -350,38 +434,77 @@ def fig_framing_by_dimension(results: list[dict], out_dir: str, subtitle: str = 
     width = 0.35
 
     fig, ax = plt.subplots(figsize=(8, 5))
+    compare = (
+        LABEL_RULE != "llm"
+    )  # second (LLM) series only when the primary is legacy regex
+    if not compare:
+        width = 0.6
     ax.bar(
-        x - width / 2, regex_rates, width,
-        label="Regex monitor",
+        x - (width / 2 if compare else 0),
+        regex_rates,
+        width,
+        label=_label_name(),
         color=[dim_colors.get(d, "#9E9E9E") for d in dims],
         alpha=0.85,
         yerr=[regex_lo, regex_hi],
         error_kw={"elinewidth": 1.2, "capsize": 3, "ecolor": "black"},
     )
-    ax.bar(
-        x + width / 2, llm_rates, width,
-        label="LLM monitor",
-        color=[dim_colors.get(d, "#9E9E9E") for d in dims],
-        alpha=0.45,
-        yerr=[llm_lo, llm_hi],
-        error_kw={"elinewidth": 1.2, "capsize": 3, "ecolor": "black"},
-    )
+    if compare:
+        ax.bar(
+            x + width / 2,
+            llm_rates,
+            width,
+            label="LLM monitor",
+            color=[dim_colors.get(d, "#9E9E9E") for d in dims],
+            alpha=0.45,
+            yerr=[llm_lo, llm_hi],
+            error_kw={"elinewidth": 1.2, "capsize": 3, "ecolor": "black"},
+        )
 
     # Labels
     for i, (rr, lr) in enumerate(zip(regex_rates, llm_rates)):
-        ax.text(x[i] - width / 2, rr + 0.03, f"{rr:.0%}", ha="center", va="bottom", fontsize=8)
-        ax.text(x[i] + width / 2, lr + 0.03, f"{lr:.0%}", ha="center", va="bottom", fontsize=8)
+        ax.text(
+            x[i] - (width / 2 if compare else 0),
+            rr + 0.03,
+            f"{rr:.0%}",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+        )
+        if compare:
+            ax.text(
+                x[i] + width / 2,
+                lr + 0.03,
+                f"{lr:.0%}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
 
-    ax.axhline(base_regex, color="#607D8B", linestyle="--", linewidth=1.0,
-               label=f"BASE regex ({base_regex:.0%})")
-    ax.axhline(base_llm, color="#607D8B", linestyle=":", linewidth=1.0,
-               label=f"BASE LLM ({base_llm:.0%})")
+    ax.axhline(
+        base_regex,
+        color="#607D8B",
+        linestyle="--",
+        linewidth=1.0,
+        label=f"BASE {_label_name()} ({base_regex:.0%})",
+    )
+    if compare:
+        ax.axhline(
+            base_llm,
+            color="#607D8B",
+            linestyle=":",
+            linewidth=1.0,
+            label=f"BASE LLM ({base_llm:.0%})",
+        )
 
     ax.set_xticks(x)
     ax.set_xticklabels([d.capitalize() for d in dims])
     ax.set_ylabel("Mean secret disclosure rate")
-    ax.set_title(f"Disclosure Rate by Framing Dimension\n{subtitle}" if subtitle else
-                 "Disclosure Rate by Framing Dimension")
+    ax.set_title(
+        f"Disclosure Rate by Framing Dimension\n{subtitle}"
+        if subtitle
+        else "Disclosure Rate by Framing Dimension"
+    )
     ax.set_ylim(-0.05, 1.15)
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f"{y:.0%}"))
     ax.legend(loc="upper right", fontsize=8)
@@ -392,6 +515,7 @@ def fig_framing_by_dimension(results: list[dict], out_dir: str, subtitle: str = 
 
 
 # ── Figure 3: Heatmap — condition × secret value ──────────────────────────────
+
 
 def fig_framing_heatmap(results: list[dict], out_dir: str, subtitle: str = "") -> None:
     import matplotlib.pyplot as plt
@@ -408,6 +532,7 @@ def fig_framing_heatmap(results: list[dict], out_dir: str, subtitle: str = "") -
     # Secret values: sort numerically where possible
     def _sort_key(s: str) -> float:
         import re
+
         m = re.match(r"(\d+)", s)
         return float(m.group(1)) if m else float("inf")
 
@@ -419,9 +544,11 @@ def fig_framing_heatmap(results: list[dict], out_dir: str, subtitle: str = "") -
         for j, s in enumerate(secrets):
             sub = [r for r in regular if _framing_key(r) == k and _secret_label(r) == s]
             if sub:
-                matrix[i, j] = sum(_regex_disclosed(r) for r in sub) / len(sub)
+                matrix[i, j] = sum(bool(_primary(r)) for r in sub) / len(sub)
 
-    fig, ax = plt.subplots(figsize=(max(6, len(secrets) * 1.4), max(5, len(keys) * 0.5)))
+    fig, ax = plt.subplots(
+        figsize=(max(6, len(secrets) * 1.4), max(5, len(keys) * 0.5))
+    )
     im = ax.imshow(matrix, aspect="auto", cmap="RdYlGn", vmin=0, vmax=1)
 
     ax.set_xticks(np.arange(len(secrets)))
@@ -430,8 +557,11 @@ def fig_framing_heatmap(results: list[dict], out_dir: str, subtitle: str = "") -
     ax.set_yticklabels([label_of.get(k, k) for k in keys], fontsize=8)
     ax.set_xlabel("Secret value")
     ax.set_ylabel("Framing condition")
-    ax.set_title(f"Regex Disclosure Rate: Condition × Secret Value\n{subtitle}" if subtitle else
-                 "Regex Disclosure Rate: Condition × Secret Value")
+    ax.set_title(
+        f"Disclosure Rate ({_label_name()}): Condition × Secret Value\n{subtitle}"
+        if subtitle
+        else f"Disclosure Rate ({_label_name()}): Condition × Secret Value"
+    )
 
     # Annotate cells
     for i in range(len(keys)):
@@ -439,8 +569,15 @@ def fig_framing_heatmap(results: list[dict], out_dir: str, subtitle: str = "") -
             v = matrix[i, j]
             if not math.isnan(v):
                 text_color = "black" if 0.3 < v < 0.7 else "white"
-                ax.text(j, i, f"{v:.0%}", ha="center", va="center",
-                        fontsize=7, color=text_color)
+                ax.text(
+                    j,
+                    i,
+                    f"{v:.0%}",
+                    ha="center",
+                    va="center",
+                    fontsize=7,
+                    color=text_color,
+                )
 
     plt.colorbar(im, ax=ax, fraction=0.03, pad=0.02, label="Disclosure rate")
     fig.tight_layout()
@@ -450,12 +587,18 @@ def fig_framing_heatmap(results: list[dict], out_dir: str, subtitle: str = "") -
 
 # ── Figure 4: Monitor agreement scatter per dimension ─────────────────────────
 
-def fig_framing_monitor_agreement(results: list[dict], out_dir: str, subtitle: str = "") -> None:
+
+def fig_framing_monitor_agreement(
+    results: list[dict], out_dir: str, subtitle: str = ""
+) -> None:
     import matplotlib.pyplot as plt
     import numpy as np
 
     regular = [r for r in results if _control_type(r) is None]
     if not regular:
+        return
+    if not _has_regex(results):
+        print("  [SKIP] Monitor agreement: no regex labels (judge-only run).")
         return
 
     dims = ["motivation", "incentive", "audience", "control"]
@@ -464,8 +607,14 @@ def fig_framing_monitor_agreement(results: list[dict], out_dir: str, subtitle: s
 
     # Build per-dim color maps (one color per condition key within dim)
     _PALETTE = [
-        "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
-        "#9467bd", "#8c564b", "#e377c2", "#7f7f7f",
+        "#1f77b4",
+        "#ff7f0e",
+        "#2ca02c",
+        "#d62728",
+        "#9467bd",
+        "#8c564b",
+        "#e377c2",
+        "#7f7f7f",
     ]
 
     rng = np.random.default_rng(seed=0)
@@ -486,7 +635,7 @@ def fig_framing_monitor_agreement(results: list[dict], out_dir: str, subtitle: s
 
         for k in keys_in_dim:
             sub = [r for r in dim_subset if _framing_key(r) == k]
-            xs = [float(_regex_disclosed(r)) for r in sub]
+            xs = [float(_legacy_regex(r)) for r in sub]
             ys_raw = [_llm_disclosed(r) for r in sub]
             ys = [float(y) if y is not None else 0.5 for y in ys_raw]
 
@@ -517,6 +666,7 @@ def fig_framing_monitor_agreement(results: list[dict], out_dir: str, subtitle: s
 
 # ── Figure 5: Empirical explicitness spectrum ──────────────────────────────────
 
+
 def fig_framing_spectrum(results: list[dict], out_dir: str) -> None:
     """Line plot of conditions ordered empirically by mean disclosure rate (low→high).
 
@@ -541,7 +691,7 @@ def fig_framing_spectrum(results: list[dict], out_dir: str) -> None:
     for k in all_keys:
         subset = [r for r in regular if _framing_key(r) == k]
         n = len(subset)
-        p = sum(_regex_disclosed(r) for r in subset) / n if n else 0.0
+        p = sum(bool(_primary(r)) for r in subset) / n if n else 0.0
         lo, hi = wilson_ci(p, n)
         stats[k] = {"p": p, "n": n, "lo": lo, "hi": hi}
 
@@ -562,10 +712,14 @@ def fig_framing_spectrum(results: list[dict], out_dir: str) -> None:
 
     # Error bars + scatter coloured by dimension
     ax.errorbar(
-        xs, ys,
+        xs,
+        ys,
         yerr=[lo_errs, hi_errs],
         fmt="none",
-        elinewidth=1.0, capsize=3, ecolor="black", zorder=2,
+        elinewidth=1.0,
+        capsize=3,
+        ecolor="black",
+        zorder=2,
     )
 
     # Scatter points coloured by dimension
@@ -578,14 +732,25 @@ def fig_framing_spectrum(results: list[dict], out_dir: str) -> None:
 
     # Annotate points with condition key
     for xi, (k, y, hi_e) in enumerate(zip(sorted_keys, ys, hi_errs)):
-        ax.text(xi, y + hi_e + 0.03, k, ha="center", va="bottom",
-                fontsize=6, rotation=55, color="dimgray")
+        ax.text(
+            xi,
+            y + hi_e + 0.03,
+            k,
+            ha="center",
+            va="bottom",
+            fontsize=6,
+            rotation=55,
+            color="dimgray",
+        )
 
     ax.set_xticks(xs)
-    ax.set_xticklabels([label_of.get(k, k) for k in sorted_keys],
-                       rotation=40, ha="right", fontsize=7)
-    ax.set_ylabel("Secret disclosure rate (regex)")
-    ax.set_title("Empirical Framing Spectrum: Conditions Ordered by Disclosure Rate (Wilson 95% CI)")
+    ax.set_xticklabels(
+        [label_of.get(k, k) for k in sorted_keys], rotation=40, ha="right", fontsize=7
+    )
+    ax.set_ylabel(f"Secret disclosure rate ({_label_name()})")
+    ax.set_title(
+        "Empirical Framing Spectrum: Conditions Ordered by Disclosure Rate (Wilson 95% CI)"
+    )
     ax.set_ylim(-0.05, 1.20)
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f"{y:.0%}"))
     ax.grid(axis="y", linewidth=0.4, alpha=0.5)
@@ -600,6 +765,7 @@ def fig_framing_spectrum(results: list[dict], out_dir: str) -> None:
 
 # ── Effect size table ──────────────────────────────────────────────────────────
 
+
 def print_effect_sizes(results: list[dict]) -> None:
     """Print a terminal table of Cohen's h effect sizes and p-values vs BASE."""
     regular = [r for r in results if _control_type(r) is None]
@@ -611,14 +777,16 @@ def print_effect_sizes(results: list[dict]) -> None:
     # BASE stats
     base_sub = [r for r in regular if _framing_key(r) == "BASE"]
     base_n = len(base_sub)
-    base_k = sum(_regex_disclosed(r) for r in base_sub)
+    base_k = sum(bool(_primary(r)) for r in base_sub)
     base_p = base_k / base_n if base_n else 0.0
     base_lo, base_hi = wilson_ci(base_p, base_n)
 
     print()
     print(f"  Effect sizes relative to BASE ({base_p:.0%}, n={base_n})")
     print(f"  {'─' * 72}")
-    print(f"  {'COND':<12} {'DIM':<12} {'RATE':>6}  {'Cohen h':>8}  {'95% CI':>14}  {'p-value':>10}  SIG")
+    print(
+        f"  {'COND':<12} {'DIM':<12} {'RATE':>6}  {'Cohen h':>8}  {'95% CI':>14}  {'p-value':>10}  SIG"
+    )
     print(f"  {'─' * 72}")
 
     for k in keys:
@@ -626,7 +794,7 @@ def print_effect_sizes(results: list[dict]) -> None:
             continue
         subset = [r for r in regular if _framing_key(r) == k]
         n = len(subset)
-        k_count = sum(_regex_disclosed(r) for r in subset)
+        k_count = sum(bool(_primary(r)) for r in subset)
         p = k_count / n if n else 0.0
         h = cohen_h(base_p, p)
         pval = two_prop_z_test(base_k, base_n, k_count, n)
@@ -634,13 +802,15 @@ def print_effect_sizes(results: list[dict]) -> None:
 
         # Wilson CI on h (approximate: propagate via delta method)
         p_lo, p_hi = wilson_ci(p, n)
-        h_lo = cohen_h(base_p, p_hi)   # note: higher p → smaller h (less suppression)
+        h_lo = cohen_h(base_p, p_hi)  # note: higher p → smaller h (less suppression)
         h_hi = cohen_h(base_p, p_lo)
         ci_str = f"[{h_lo:+.2f}, {h_hi:+.2f}]"
 
         pval_str = f"p < 0.001" if pval < 0.001 else f"p = {pval:.3f}"
         dim = dim_of.get(k, "")
-        print(f"  {k:<12} {dim:<12} {p:>6.1%}  {h:>+8.2f}  {ci_str:>14}  {pval_str:>10}  {stars}")
+        print(
+            f"  {k:<12} {dim:<12} {p:>6.1%}  {h:>+8.2f}  {ci_str:>14}  {pval_str:>10}  {stars}"
+        )
 
     print(f"  {'─' * 72}")
     print(f"  Cohen's h: small=0.20, medium=0.50, large=0.80")
@@ -650,58 +820,65 @@ def print_effect_sizes(results: list[dict]) -> None:
 
 # ── Summary table ──────────────────────────────────────────────────────────────
 
+
 def print_summary_table(results: list[dict]) -> None:
     regular = [r for r in results if _control_type(r) is None]
     controls = [r for r in results if _control_type(r) is not None]
+    legacy = _has_regex(results) and LABEL_RULE == "llm"
 
     order, dim_of, label_of = _get_order()
     seen_keys = {_framing_key(r) for r in regular}
     keys = [k for k in order if k in seen_keys] or sorted(seen_keys)
 
-    W_key = 12
-    W_dim = 12
-    W_label = 26
+    def rate(sub, fn):
+        vals = [v for v in (fn(r) for r in sub) if v is not None]
+        return sum(vals) / len(vals) if vals else float("nan")
+
+    W_key, W_dim, W_label = 12, 12, 26
+    extra = f"  {'REGEX%':>7}" if legacy else ""
     print()
     print(f"  {'─' * 82}")
-    print(f"  {'COND':<{W_key}} {'DIM':<{W_dim}} {'LABEL':<{W_label}} "
-          f"{'N':>5}  {'REGEX%':>7}  {'LLM%':>7}")
+    print(
+        f"  {'COND':<{W_key}} {'DIM':<{W_dim}} {'LABEL':<{W_label}} "
+        f"{'N':>5}  {'DISC%':>7}{extra}   (DISC = {_label_name()})"
+    )
     print(f"  {'─' * 82}")
-
-    for k in keys:
-        subset = [r for r in regular if _framing_key(r) == k]
-        n = len(subset)
-        regex_r = sum(_regex_disclosed(r) for r in subset) / n if n else 0.0
-        llm_vals = [_llm_disclosed(r) for r in subset if _llm_disclosed(r) is not None]
-        llm_r = sum(llm_vals) / len(llm_vals) if llm_vals else float("nan")
-        dim = dim_of.get(k, "")
-        label = label_of.get(k, "")
-        print(f"  {k:<{W_key}} {dim:<{W_dim}} {label:<{W_label}} "
-              f"{n:>5}  {regex_r:>7.1%}  {llm_r:>7.1%}")
-
-    if controls:
-        print(f"  {'─' * 82}")
-        for ctrl_type in ("no_secret", "irrelevant_secret"):
-            subset = [r for r in controls if _control_type(r) == ctrl_type]
-            if not subset:
-                continue
-            n = len(subset)
-            regex_r = sum(_regex_disclosed(r) for r in subset) / n if n else 0.0
-            llm_vals = [_llm_disclosed(r) for r in subset if _llm_disclosed(r) is not None]
-            llm_r = sum(llm_vals) / len(llm_vals) if llm_vals else float("nan")
-            print(f"  {ctrl_type:<{W_key}} {'control':<{W_dim}} {'':<{W_label}} "
-                  f"{n:>5}  {regex_r:>7.1%}  {llm_r:>7.1%}")
-
+    rows = [
+        (
+            k,
+            dim_of.get(k, ""),
+            label_of.get(k, ""),
+            [r for r in regular if _framing_key(r) == k],
+        )
+        for k in keys
+    ]
+    rows += [
+        (t, "control", "", [r for r in controls if _control_type(r) == t])
+        for t in ("no_secret", "irrelevant_secret")
+    ]
+    for k, dim, label, subset in rows:
+        if not subset:
+            continue
+        col = f"  {rate(subset, _legacy_regex):>7.1%}" if legacy else ""
+        print(
+            f"  {k:<{W_key}} {dim:<{W_dim}} {label:<{W_label}} "
+            f"{len(subset):>5}  {rate(subset, _primary):>7.1%}{col}"
+        )
     print(f"  {'─' * 82}")
-    print(f"  Total: {len(results)} prompts ({len(regular)} regular, {len(controls)} controls)")
+    print(
+        f"  Total: {len(results)} prompts ({len(regular)} regular, {len(controls)} controls)"
+    )
     print()
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
+
 def plot_all_framing(results_path: str) -> None:
     """Generate all framing plots for a results JSON file."""
     try:
         import matplotlib
+
         matplotlib.use("Agg")
     except ImportError:
         print("  [ERROR] matplotlib not installed. Run: pip install matplotlib")
@@ -709,6 +886,16 @@ def plot_all_framing(results_path: str) -> None:
 
     payload, results = _load(results_path)
     out_dir = os.path.dirname(results_path) or "."
+    labelled = [r for r in results if _primary(r) is not None]
+    if len(labelled) < len(results):
+        print(
+            f"  [NOTE] {len(results) - len(labelled)}/{len(results)} rows have no {_label_name()} "
+            "label and are excluded (judge with `python -m scripts.judge_results`)."
+        )
+    if not labelled:
+        print("  [ERROR] No labelled rows — judge this run first.")
+        return
+    results = labelled
     subtitle = _subtitle(payload, results)
 
     print_summary_table(results)
@@ -721,8 +908,17 @@ def plot_all_framing(results_path: str) -> None:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print(f"Usage: python {sys.argv[0]} <results_json_path>")
-        sys.exit(1)
-    plot_all_framing(sys.argv[1])
+    import argparse
+
+    ap = argparse.ArgumentParser(description="Framing experiment figures")
+    ap.add_argument("results", help="results JSON (judged)")
+    ap.add_argument(
+        "--label-rule",
+        choices=["llm", "regex"],
+        default="llm",
+        help="primary disclosure label; 'regex' reproduces pre-2026-11-13 figures",
+    )
+    a = ap.parse_args()
+    LABEL_RULE = a.label_rule
+    plot_all_framing(a.results)
     print("Done.")

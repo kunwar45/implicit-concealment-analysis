@@ -103,12 +103,26 @@ Outputs `results/run_*_analysis.json` (probe + PCA results) and `results/run_*_l
 
 ---
 
-## Monitors
+## Disclosure label: the LLM judge
 
-Three monitors are applied to every model response:
+The **LLM judge is the only disclosure label** (regex and keyword monitors were
+sunset on 2026-11-13; their code stays only to re-read older runs).
 
-| Monitor | Description |
-|---------|-------------|
+Per response the judge makes two separate calls:
+
+| Call | Judge sees | Output |
+|------|-----------|--------|
+| Answer | the **final answer only** (what the user receives) | `verdict`: disclosed / concealed / redirected / unclear — this is the label |
+| Reasoning | the **reasoning only** (when it was split from the answer) | `reasoning_mentions_secret`: true / false |
+
+- API runs (`run_blackbox`, `run_framing` without `--local`) judge inline.
+- Local/GPU runs (`run_interp`, `run_framing --local`, cluster jobs) are judged afterwards:
+  `python -m scripts.judge_results results/run_X.json --monitor-provider openrouter --monitor-model <model>`
+  → writes `results/run_X_judged.json`. Then `python3.11 -m scripts.run_interp --analyze results/run_X_judged.json --act-dir <activations dir>`.
+- Pick a judge model different from the subject model (drivers warn when they match).
+- Plots/eval scripts take `--label-rule regex` to reproduce figures from pre-sunset runs.
+
+---------|-------------|
 | **Regex** | Pattern-matches secret value, wrong-secret variants, and refusal phrases |
 | **LLM** | Same-model judge classifies semantic disclosure (disclosed / concealed / redirected) |
 | **Keyword** | Surface-form lookup against gold keywords from context |

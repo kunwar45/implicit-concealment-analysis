@@ -32,6 +32,7 @@ class Config:
     # Providers (src/clients/factory.py) and reasoning-model switches
     subject_provider: str = "together"   # together | openrouter | vllm | hf
     monitor_provider: str = "together"
+    judge_max_tokens: int = 300          # per judge call; raise for reasoning-model judges
     enable_thinking: bool | None = None  # Qwen3/3.6 thinking mode; None = template default
     base_model_revision: str | None = None  # HF commit sha the subject weights were pinned to
     format_instruction: bool = True      # append the <reasoning>/<answer> instruction

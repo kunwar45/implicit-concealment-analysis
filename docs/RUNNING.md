@@ -188,6 +188,37 @@ results/activation_pca.png
 
 ---
 
+## Judging Results (LLM judge, post-hoc)
+
+The LLM judge is the only disclosure label. Runs without an inline judge
+(`run_interp`, `run_framing --local`, GPU/cluster jobs) are saved unjudged; judge them with:
+
+```bash
+python -m scripts.judge_results results/run_X.json \
+  --monitor-provider openrouter --monitor-model <judge-model> [--workers 8] [--force]
+```
+
+Writes `results/run_X_judged.json` (the source is never modified); `--force` re-judges.
+Providers: `together`, `openrouter` (`OPENROUTER_API_KEY`), `vllm` (`VLLM_BASE_URL`), `hf`.
+Use `--judge-max-tokens 1024+` for reasoning-model judges.
+
+Re-run interp analyses on a judged run without regenerating:
+
+```bash
+python3.11 -m scripts.run_interp --analyze results/run_X_judged.json --act-dir activations/<run>/<model>
+```
+
+## Model / provider flags (all drivers)
+
+| Flag | Meaning |
+|------|---------|
+| `--provider together\|openrouter\|vllm\|hf` | where the subject model runs (`run_blackbox`, `run_framing`) |
+| `--monitor-provider`, `--monitor-model` | where/which LLM judge runs |
+| `--thinking on\|off\|default` | Qwen3/3.6 thinking switch |
+| `--no-format-instruction` | omit the `<reasoning>/<answer>` instruction (native `<think>` models) |
+| `--revision <sha>` | pin HF weights (`run_interp`, `run_framing --local`) |
+| `--temperature` | subject sampling temperature (default 0.7; recorded in the results JSON) |
+
 ## Plotting Standalone
 
 All plot scripts can be run standalone on existing result files:

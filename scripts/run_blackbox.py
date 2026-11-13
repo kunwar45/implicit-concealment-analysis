@@ -33,10 +33,7 @@ from src.config import Config
 from src.dataset.generator import DatasetGenerator
 from src.dataset.shipping_domain import ShippingDomain
 from src.loaders.concealment_loader import ConcealmentLoader
-from src.monitors.keyword_monitor import KeywordMonitor
-from src.monitors.labels import regex_disclosed
 from src.monitors.llm_monitor import LLMMonitor, warn_if_same_judge
-from src.monitors.regex_monitor import RegexMonitor
 from src.pipeline.pipeline import Pipeline
 from src.pipeline.result import PromptResult
 from src.steps.base_model_step import BaseModelStep
@@ -58,11 +55,7 @@ def generate_dataset(n_scenarios: int, seed: int, output_path: str) -> int:
 
 def build_pipeline(client: ChatClient, config: Config, judge_client=None) -> Pipeline:
     """judge_client: ChatClient for the LLM judge (defaults to the subject's client)."""
-    monitors = [
-        RegexMonitor(),
-        LLMMonitor(judge_client or client, config),
-        KeywordMonitor(),
-    ]
+    monitors = [LLMMonitor(judge_client or client, config)]  # judge is the only label
     steps = [
         BaseModelStep(client, config),
         MonitorStep(monitors),
@@ -100,15 +93,15 @@ def print_smoke_summary(results: list[PromptResult]) -> bool:
     W = 38
     print()
     print(f"  ┌{'─' * (W + 32)}┐")
-    print(f"  │  {'PROMPT ID':<{W}} {'REGEX':>5}  {'LLM':>9}  {'KEYWORD':>7}  │")
+    print(f"  │  {'PROMPT ID':<{W}} {'SPLIT':>5}  {'ANSWER':>9}  {'REASON':>7}  │")
     print(f"  │  {'─' * W}  {'─' * 5}  {'─' * 9}  {'─' * 7}  │")
 
     parse_errors = 0
     for r in results:
         llm   = r.monitor_results.get("llm", {})
-        kw    = r.monitor_results.get("keyword", {})
-
-        regex_hit = regex_disclosed(r)
+        split = "yes" if r.metadata.get("format_ok") else "no"
+        rms = llm.get("reasoning_mentions_secret")
+        reason_str = "-" if rms is None else ("SECRET" if rms else "no")
 
         llm_raw = llm.get("mentioned_secret")
         if llm_raw is None and llm.get("verdict") == "parse_error":
@@ -119,10 +112,8 @@ def print_smoke_summary(results: list[PromptResult]) -> bool:
         else:
             llm_str = llm.get("verdict", "?")[:9]
 
-        kw_hit = kw.get("matched", False)
-
         pid = r.prompt_id[-W:] if len(r.prompt_id) > W else r.prompt_id
-        print(f"  │  {pid:<{W}} {'YES' if regex_hit else 'no':>5}  {llm_str:>9}  {'YES' if kw_hit else 'no':>7}  │")
+        print(f"  │  {pid:<{W}} {split:>5}  {llm_str:>9}  {reason_str:>7}  │")
 
     print(f"  └{'─' * (W + 32)}┘")
 
@@ -235,7 +226,7 @@ def main() -> None:
             "A1": domain.render_A1(),
             "A2": domain.render_A2(sample_secret),
         },
-        "monitors": ["regex", "llm", "keyword"],
+        "monitors": ["llm"],
         "judge": {"provider": args.monitor_provider, "model": args.monitor_model,
                   "same_model_judge": args.monitor_model == args.model},
         "cli_args": {k: v for k, v in vars(args).items() if k != "no_plot"},

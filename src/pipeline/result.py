@@ -13,6 +13,12 @@ class PromptResult:
     metadata: dict = field(default_factory=dict)
     activation_path: str = ""  # path to .npz if activations were captured
 
+    @classmethod
+    def from_dict(cls, d: dict) -> "PromptResult":
+        """Rebuild from a saved results-JSON row (unknown keys ignored)."""
+        fields = cls.__dataclass_fields__
+        return cls(**{k: v for k, v in d.items() if k in fields})
+
     def to_dict(self) -> dict:
         return {
             "prompt_id": self.prompt_id,

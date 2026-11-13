@@ -38,9 +38,7 @@ from src.dataset.generator import DatasetGenerator
 from src.dataset.shipping_domain import ShippingDomain
 from src.interp.activation_store import ActivationStore
 from src.loaders.concealment_loader import ConcealmentLoader
-from src.monitors.keyword_monitor import KeywordMonitor
-from src.monitors.labels import regex_disclosed
-from src.monitors.regex_monitor import RegexMonitor
+from src.monitors.labels import DEFAULT_RULE, disclosed
 from src.pipeline.pipeline import Pipeline
 from src.pipeline.result import PromptResult
 from src.steps.base_model_step import BaseModelStep
@@ -60,7 +58,7 @@ def generate_dataset(n_scenarios: int, seed: int, output_path: str) -> int:
 # ── Pipeline (no LLM monitor — local only) ───────────────────────────────────
 
 def build_pipeline(client: HFClient, max_tokens: int = 256, temperature: float = 0.7) -> Pipeline:
-    monitors = [RegexMonitor(), KeywordMonitor()]
+    monitors = []  # unjudged: run `python -m scripts.judge_results <results.json>` afterwards
     steps = [BaseModelStep(client, _dummy_config(client, max_tokens, temperature)),
              MonitorStep(monitors)]
     return Pipeline(steps)
@@ -107,7 +105,7 @@ def run_inference(
     config.format_instruction = format_instruction
     config.base_model_revision = client.revision
 
-    monitors = [RegexMonitor(), KeywordMonitor()]
+    monitors = []  # unjudged: run `python -m scripts.judge_results <results.json>` afterwards
     steps = [BaseModelStep(client, config), MonitorStep(monitors)]
     pipeline = Pipeline(steps)
     results = pipeline.run(prompts)
@@ -120,9 +118,21 @@ def run_inference(
 
 # ── Probe experiment ──────────────────────────────────────────────────────────
 
+LABEL_RULE = DEFAULT_RULE  # "llm" — the judge's verdict on the final answer
+
+
 def _disclosed(r: dict) -> bool:
-    """Return True if the regex monitor detected secret disclosure."""
-    return regex_disclosed(r)
+    """True only if the judge says disclosed (unjudged/unclear → False here)."""
+    return disclosed(r, LABEL_RULE) is True
+
+
+def _concealed(r: dict) -> bool:
+    """True only if the judge says concealed/redirected (unjudged → False, NOT concealed)."""
+    return disclosed(r, LABEL_RULE) is False
+
+
+def _labelled(r: dict) -> bool:
+    return disclosed(r, LABEL_RULE) is not None
 
 
 def _is_regular(r: dict) -> bool:
@@ -163,7 +173,7 @@ def run_probes(
 
     Core probes (always run):
       condition    : A0=0 vs A2=1 (where does the model encode 'suppress'?)
-      disclosure   : regex_disclosed=0/1 (where does the model commit to answer?)
+      disclosure   : judge verdict 0/1 on the final answer (unjudged rows excluded)
 
     A1 behavior-filtered probes (when A1 data present):
       a1c_vs_a2c   : A1-concealing vs A2-concealing (same mechanism?)
@@ -194,8 +204,12 @@ def run_probes(
     else:
         print(f"  [SKIP] Condition probe: only {len(a0a2_ids)} A0/A2 samples (need {2*min_samples_per_class})")
 
-    # ── Disclosure probe: regex_disclosed yes/no ──────────────────────────
-    regular_ids = store.filter_ids(lambda r: _is_regular(r))
+    # ── Disclosure probe: judge verdict yes/no (unjudged rows excluded) ───
+    regular_ids = store.filter_ids(lambda r: _is_regular(r) and _labelled(r))
+    n_unjudged = len(store.filter_ids(lambda r: _is_regular(r) and not _labelled(r)))
+    if n_unjudged:
+        print(f"  [NOTE] {n_unjudged} regular prompts have no judge verdict — excluded "
+              "(run `python -m scripts.judge_results <results.json>`)")
     disc_labels = store.get_labels(
         lambda r: int(_disclosed(r)),
         prompt_ids=regular_ids,
@@ -221,7 +235,7 @@ def run_probes(
         # Subgroups
         a1_concealing_ids = store.filter_ids(
             lambda r: r.get("metadata", {}).get("condition") == "A1"
-            and _is_regular(r) and not _disclosed(r)
+            and _is_regular(r) and _concealed(r)
         )
         a1_disclosing_ids = store.filter_ids(
             lambda r: r.get("metadata", {}).get("condition") == "A1"
@@ -229,7 +243,7 @@ def run_probes(
         )
         a2_concealing_ids = store.filter_ids(
             lambda r: r.get("metadata", {}).get("condition") == "A2"
-            and _is_regular(r) and not _disclosed(r)
+            and _is_regular(r) and _concealed(r)
         )
         a0_disclosing_ids = store.filter_ids(
             lambda r: r.get("metadata", {}).get("condition") == "A0"
@@ -352,7 +366,7 @@ def run_logit_lens(
             r_a1 = group["A1"]
             probs_a1 = _logit_lens_one(client, r_a1, target_tok_id, final_ln, lm_head_weight)
             entry["a1_probs"] = probs_a1.tolist()
-            entry["a1_disclosed"] = _disclosed(r_a1)
+            entry["a1_disclosed"] = disclosed(r_a1, LABEL_RULE)
 
         lens_data.append(entry)
         a1_info = ""
@@ -494,7 +508,7 @@ def run_a1_projection(
     )
     a1c_ids = store.filter_ids(
         lambda r: r.get("metadata", {}).get("condition") == "A1"
-        and _is_regular(r) and not _disclosed(r)
+        and _is_regular(r) and _concealed(r)
     )
 
     if len(a0_ids) < 3 or len(a2_ids) < 3 or len(a1c_ids) < 2:
@@ -560,7 +574,7 @@ def run_cosine_similarity(store: ActivationStore) -> dict[int, dict[str, float]]
     )
     a1c_ids = store.filter_ids(
         lambda r: r.get("metadata", {}).get("condition") == "A1"
-        and _is_regular(r) and not _disclosed(r)
+        and _is_regular(r) and _concealed(r)
     )
     a1d_ids = store.filter_ids(
         lambda r: r.get("metadata", {}).get("condition") == "A1"
@@ -568,7 +582,7 @@ def run_cosine_similarity(store: ActivationStore) -> dict[int, dict[str, float]]
     )
     a2c_ids = store.filter_ids(
         lambda r: r.get("metadata", {}).get("condition") == "A2"
-        and _is_regular(r) and not _disclosed(r)
+        and _is_regular(r) and _concealed(r)
     )
 
     # Need at least 1 sample per group for mean; skip groups that are empty
@@ -665,6 +679,12 @@ def parse_args() -> argparse.Namespace:
                         help="Omit the <reasoning>/<answer> instruction (native <think> models)")
     parser.add_argument("--revision", default=None,
                         help="HF commit sha to pin the model weights to (default: main)")
+    parser.add_argument("--analyze", metavar="RESULTS_JSON", default=None,
+                        help="Skip generation: run analyses on this (judged) results JSON + --act-dir")
+    parser.add_argument("--act-dir", default=None,
+                        help="Activations directory for --analyze")
+    parser.add_argument("--label-rule", default=DEFAULT_RULE, choices=["llm", "regex"],
+                        help="Disclosure label: llm judge (default) or legacy regex for old runs")
     parser.add_argument("--n-logit-pairs", type=int, default=3,
                         help="Number of A0/A2 pairs for logit-lens analysis")
     parser.add_argument("--seed", type=int, default=42)
@@ -734,7 +754,7 @@ def print_smoke_summary(results: list[PromptResult], store: ActivationStore) -> 
     W = 36
     print()
     print(f"  ┌{'─' * (W + 26)}┐")
-    print(f"  │  {'PROMPT ID':<{W}} {'COND':>4}  {'ACT':>3}  {'REGEX':>5}  │")
+    print(f"  │  {'PROMPT ID':<{W}} {'COND':>4}  {'ACT':>3}  {'SPLIT':>5}  │")
     print(f"  │  {'─' * W}  {'─' * 4}  {'─' * 3}  {'─' * 5}  │")
     errors = 0
     for r in results:
@@ -742,9 +762,9 @@ def print_smoke_summary(results: list[PromptResult], store: ActivationStore) -> 
         has_act = "✓" if r.activation_path else "✗"
         if not r.activation_path:
             errors += 1
-        regex_hit = "YES" if regex_disclosed(r) else "no"
+        split = "yes" if r.metadata.get("format_ok") else "no"
         pid = r.prompt_id[-W:] if len(r.prompt_id) > W else r.prompt_id
-        print(f"  │  {pid:<{W}} {cond:>4}  {has_act:>3}  {regex_hit:>5}  │")
+        print(f"  │  {pid:<{W}} {cond:>4}  {has_act:>3}  {split:>5}  │")
     print(f"  └{'─' * (W + 26)}┘")
 
     print(f"\n  Store: {len(store)} prompts indexed, {store.n_layers()} layers")
@@ -759,6 +779,24 @@ def print_smoke_summary(results: list[PromptResult], store: ActivationStore) -> 
 
 def main() -> None:
     args = parse_args()
+    global LABEL_RULE
+    LABEL_RULE = args.label_rule
+
+    # ── Analysis-only: re-run analyses on a (judged) run + its saved activations ──
+    if args.analyze:
+        if not args.act_dir:
+            sys.exit("--analyze needs --act-dir (the run's activations directory)")
+        store = ActivationStore(args.act_dir, args.analyze)
+        rows = store.get_results()
+        n_judged = sum(1 for r in rows if _labelled(r))
+        print(f"  {len(store)} prompts indexed, {store.n_layers()} layers; "
+              f"{n_judged}/{len(rows)} rows judged (rule={LABEL_RULE})")
+        if n_judged == 0:
+            print("  [WARN] no judged rows — disclosure analyses will be skipped; "
+                  "run `python -m scripts.judge_results <results.json>` first")
+        analyze(store, args.analyze, args.act_dir, args.conditions,
+                os.path.dirname(args.analyze) or args.output_dir, no_plot=args.no_plot)
+        return
     os.makedirs(args.data_dir, exist_ok=True)
     os.makedirs(args.output_dir, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -839,19 +877,39 @@ def main() -> None:
 
     print(f"\n  Results saved → {result_path}")
 
-    # ── Analysis ──────────────────────────────────────────────────────────
+    analyze(store, result_path, act_dir, args.conditions, args.output_dir,
+            no_plot=args.no_plot, client=client, n_logit_pairs=args.n_logit_pairs)
+
+
+def analyze(
+    store: ActivationStore,
+    result_path: str,
+    act_dir: str,
+    conditions: str,
+    output_dir: str,
+    no_plot: bool = False,
+    client: HFClient | None = None,
+    n_logit_pairs: int = 3,
+) -> None:
+    """Probes / PCA / A1 analyses on a run's activations. Disclosure-based analyses
+    use the judge label and exclude unjudged rows; logit lens needs the model loaded
+    (client) and is skipped in --analyze mode."""
     print("\n  Running linear probes…")
     probe_results = run_probes(store)
     print_probe_summary(probe_results)
 
-    print("  Running logit lens…")
-    logit_data = run_logit_lens(client, store, n_pairs=args.n_logit_pairs)
+    logit_data: list = []
+    if client is not None:
+        print("  Running logit lens…")
+        logit_data = run_logit_lens(client, store, n_pairs=n_logit_pairs)
+    else:
+        print("  [SKIP] Logit lens (needs the model loaded; not run in --analyze mode)")
 
     print("  Running PCA…")
     pca_data = run_pca(store)
 
     # A1-specific analyses (gated on A1 being in conditions)
-    conditions_list = [c.strip() for c in args.conditions.split(",")]
+    conditions_list = [c.strip() for c in conditions.split(",")]
     projection_data: dict = {}
     cosine_data: dict = {}
     if "A1" in conditions_list:
@@ -868,7 +926,7 @@ def main() -> None:
     print(f"  Analysis saved → {analysis_path}")
 
     # ── Plot ──────────────────────────────────────────────────────────────
-    if not args.no_plot:
+    if not no_plot:
         print("\n  Generating plots…")
         try:
             from scripts.plot_interp import plot_all_interp
@@ -877,7 +935,7 @@ def main() -> None:
                 probe_results=probe_results,
                 logit_data=logit_data,
                 pca_data=pca_data,
-                out_dir=args.output_dir,
+                out_dir=output_dir,
                 projection_data=projection_data,
                 cosine_data=cosine_data,
             )

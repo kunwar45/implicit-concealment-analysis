@@ -44,7 +44,7 @@ def test_disclosure_rules(result, regex, llm, llm_first):
 
 def test_disclosure_accepts_prompt_result():
     pr = PromptResult(prompt_id="x", prompt="q", timestamp="t")
-    pr.monitor_results = {"regex": {"contains_secret_exact": True}}
+    pr.monitor_results = {"llm": {"verdict": "disclosed"}}
     assert disclosed(pr) is True
 
 

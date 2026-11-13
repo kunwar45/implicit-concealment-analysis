@@ -24,7 +24,22 @@ if ROOT not in sys.path:
 
 from src.clients.hf_client import HFClient
 from src.interp.activation_store import ActivationStore
-from src.monitors.labels import regex_disclosed as disclosed
+from src.monitors.labels import DEFAULT_RULE
+from src.monitors.labels import disclosed as _label
+
+# Disclosure label: the LLM judge's verdict on the final answer ("llm"); "regex" only
+# to re-read runs from before regex was sunset. Set from --label-rule in main().
+LABEL_RULE = DEFAULT_RULE
+
+
+def disclosed(result: dict) -> bool:
+    """True only when the label says disclosed (unjudged/unclear are NOT disclosed)."""
+    return _label(result, LABEL_RULE) is True
+
+
+def concealed(result: dict) -> bool:
+    """True only when the label says concealed (unjudged/unclear are NOT concealed)."""
+    return _label(result, LABEL_RULE) is False
 
 
 EPS = 1e-8
@@ -198,7 +213,7 @@ def identify_candidates(
     top_k_dims: int,
     max_rel_pos: int,
 ) -> dict:
-    success_ids = [p.a2["prompt_id"] for p in pairs if disclosed(p.a0) and not disclosed(p.a2)]
+    success_ids = [p.a2["prompt_id"] for p in pairs if disclosed(p.a0) and concealed(p.a2)]
     other_ids = [
         r["prompt_id"]
         for r in store.get_results()
@@ -264,7 +279,7 @@ def uniqueness_summary(
     dims: list[int],
     pairs: list[ExamplePair],
 ) -> dict:
-    success_ids = [p.a2["prompt_id"] for p in pairs if disclosed(p.a0) and not disclosed(p.a2)]
+    success_ids = [p.a2["prompt_id"] for p in pairs if disclosed(p.a0) and concealed(p.a2)]
     a2_fail_ids = [p.a2["prompt_id"] for p in pairs if disclosed(p.a2)]
     a0_disclose_ids = [p.a0["prompt_id"] for p in pairs if disclosed(p.a0)]
 
@@ -306,7 +321,7 @@ def run_causal_tests(
     dims: list[int],
 ) -> dict:
     dims_arr = np.array(dims, dtype=np.int64)
-    success_pairs = [p for p in pairs if disclosed(p.a0) and not disclosed(p.a2)]
+    success_pairs = [p for p in pairs if disclosed(p.a0) and concealed(p.a2)]
 
     patch_a0_deltas = []
     reverse_patch_a2_deltas = []
@@ -383,7 +398,11 @@ def main() -> None:
     ap.add_argument("--top-k-dims", type=int, default=8)
     ap.add_argument("--max-rel-pos", type=int, default=32)
     ap.add_argument("--out", default="")
+    ap.add_argument("--label-rule", choices=["llm", "regex"], default=DEFAULT_RULE,
+                    help="disclosure label: llm judge (default) or legacy regex for old runs")
     args = ap.parse_args()
+    global LABEL_RULE
+    LABEL_RULE = args.label_rule
 
     store = ActivationStore(args.activations, args.results)
     pairs, rows = load_pairs(args.results)

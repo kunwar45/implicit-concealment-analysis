@@ -40,10 +40,7 @@ from src.dataset.shipping_domain import ShippingDomain
 from src.framing.conditions import CONDITION_ORDER, REGISTRY
 from src.framing.framing_loader import FramingLoader
 from src.clients.factory import PROVIDERS, THINKING_CHOICES, make_client, parse_thinking
-from src.monitors.keyword_monitor import KeywordMonitor
 from src.monitors.llm_monitor import warn_if_same_judge
-from src.monitors.labels import regex_disclosed
-from src.monitors.regex_monitor import RegexMonitor
 from src.pipeline.pipeline import Pipeline
 from src.pipeline.result import PromptResult
 from src.steps.base_model_step import BaseModelStep
@@ -66,11 +63,7 @@ def generate_dataset(n_scenarios: int, seed: int, output_path: str) -> int:
 def build_pipeline(client, config: Config, judge_client=None) -> Pipeline:
     """judge_client: ChatClient for the LLM judge (defaults to the subject's client)."""
     from src.monitors.llm_monitor import LLMMonitor
-    monitors = [
-        RegexMonitor(),
-        LLMMonitor(judge_client or client, config),
-        KeywordMonitor(),
-    ]
+    monitors = [LLMMonitor(judge_client or client, config)]  # judge is the only label
     steps = [
         BaseModelStep(client, config),
         MonitorStep(monitors),
@@ -104,7 +97,7 @@ def build_pipeline_local(
     from src.clients.hf_client import HFClient
     client = HFClient(model_name=model_name, capture_mode=capture_activations, dtype=dtype,
                       enable_thinking=enable_thinking, revision=revision)
-    monitors = [RegexMonitor(), KeywordMonitor()]
+    monitors = []  # unjudged: run `python -m scripts.judge_results <results.json>` afterwards
     config = _dummy_config(model_name, max_tokens, capture_activations, temperature)
     config.subject_provider = "hf"
     config.enable_thinking = enable_thinking
@@ -144,19 +137,21 @@ def print_smoke_summary(results: list[PromptResult]) -> bool:
     DIM = 10
     print()
     print(f"  ┌{'─' * (W + DIM + 22)}┐")
-    print(f"  │  {'PROMPT ID':<{W}} {'DIM':<{DIM}} {'REGEX':>5}  {'LLM':>9}  │")
+    print(f"  │  {'PROMPT ID':<{W}} {'DIM':<{DIM}} {'SPLIT':>5}  {'ANSWER':>9}  │")
     print(f"  │  {'─' * W}  {'─' * DIM}  {'─' * 5}  {'─' * 9}  │")
 
     parse_errors = 0
     for r in results:
         llm   = r.monitor_results.get("llm", {})
 
-        regex_hit = regex_disclosed(r)
+        split = "yes" if r.metadata.get("format_ok") else "no"
 
         llm_raw = llm.get("mentioned_secret")
         if llm_raw is None and llm.get("verdict") == "parse_error":
             llm_str = "ERR"
             parse_errors += 1
+        elif not llm:
+            llm_str = "unjudged"
         elif llm_raw is None:
             llm_str = "n/a"
         else:
@@ -165,7 +160,7 @@ def print_smoke_summary(results: list[PromptResult]) -> bool:
         dim = r.metadata.get("framing_dimension", "")[:DIM]
         pid = r.prompt_id[-(W):] if len(r.prompt_id) > W else r.prompt_id
         print(
-            f"  │  {pid:<{W}} {dim:<{DIM}} {'YES' if regex_hit else 'no':>5}  {llm_str:>9}  │"
+            f"  │  {pid:<{W}} {dim:<{DIM}} {split:>5}  {llm_str:>9}  │"
         )
 
     print(f"  └{'─' * (W + DIM + 22)}┘")
@@ -323,7 +318,7 @@ def main() -> None:
             }
             for k in framing_keys
         },
-        "monitors": ["regex", "keyword"] if args.local else ["regex", "llm", "keyword"],
+        "monitors": [] if args.local else ["llm"],
         "judge": None if args.local else {
             "provider": args.monitor_provider, "model": args.monitor_model,
             "same_model_judge": args.monitor_model == args.model},

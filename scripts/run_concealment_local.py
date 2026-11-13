@@ -20,8 +20,6 @@ if ROOT not in sys.path:
 from src.clients.hf_client import HFClient
 from src.config import Config
 from src.loaders.concealment_loader import ConcealmentLoader
-from src.monitors.keyword_monitor import KeywordMonitor
-from src.monitors.regex_monitor import RegexMonitor
 from src.pipeline.pipeline import Pipeline
 from src.steps.base_model_step import BaseModelStep
 from src.steps.monitor_step import MonitorStep
@@ -71,7 +69,7 @@ def main() -> None:
     )
     pipeline = Pipeline([
         BaseModelStep(client, cfg),
-        MonitorStep([RegexMonitor(), KeywordMonitor()]),
+        MonitorStep([]),  # unjudged: run `python -m scripts.judge_results <results.json>`
     ])
     results = pipeline.run(prompts)
     output_path = ResultStorage(cfg).save(results)

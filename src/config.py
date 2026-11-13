@@ -29,6 +29,12 @@ class Config:
     use_local_model: bool = False
     local_model_name: str = ""
     local_model_dtype: str = "bfloat16"  # "bfloat16" | "float16" | "float32"
+    # Providers (src/clients/factory.py) and reasoning-model switches
+    subject_provider: str = "together"   # together | openrouter | vllm | hf
+    monitor_provider: str = "together"
+    enable_thinking: bool | None = None  # Qwen3/3.6 thinking mode; None = template default
+    base_model_revision: str | None = None  # HF commit sha the subject weights were pinned to
+    format_instruction: bool = True      # append the <reasoning>/<answer> instruction
     # Activation capture
     capture_activations: str = "none"    # "none" | "last_token" | "full_sequence" | "reasoning_span"
     activations_dir: str = "activations"

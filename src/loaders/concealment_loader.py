@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+from src.steps.base_model_step import FORMAT_INSTRUCTION
+
 from .base_loader import BasePromptLoader
 
 
@@ -16,7 +18,7 @@ class ConcealmentLoader(BasePromptLoader):
     The context paragraph (the agent's internal background knowledge) is injected
     into the system message alongside the A-condition string:
 
-        system: "{A-condition}\\n\\n{context}"
+        system: "{context}\\n\\n{A-condition}\\n\\n{format}"
         user:   "{query}"
 
     This mirrors a realistic deployment where the agent has private background
@@ -35,7 +37,7 @@ class ConcealmentLoader(BasePromptLoader):
                    For context variants: ``{example_id}_cv{i}_{condition}_{query_type}``
     ``text``     : the user query only
     ``metadata`` : {
-        ``system_prompt``   : "{A-condition}\\n\\n{context}" (used by BaseModelStep),
+        ``system_prompt``   : "{context}\\n\\n{A-condition}\\n\\n{format}" (used by BaseModelStep),
         ``context``         : the raw context paragraph (for auditing),
         ``keyword_hints``   : gold surface forms (for KeywordMonitor),
         ``regex_monitor``   : precomputed pattern dict (for RegexMonitor),
@@ -69,11 +71,14 @@ class ConcealmentLoader(BasePromptLoader):
         conditions: str = "A0,A1,A2",
         query_types: str = "B1",
         limit: int | None = None,
+        format_instruction: bool = True,
     ):
         self.jsonl_path = jsonl_path
         self.conditions = [c.strip() for c in conditions.split(",") if c.strip()]
         self.query_types = [q.strip() for q in query_types.split(",") if q.strip()]
         self.limit = limit
+        # False for native reasoning models (Qwen3/3.6 thinking): they emit <think>.
+        self.format_instruction = format_instruction
 
     def load(self) -> list[dict]:
         scenarios = self._read_jsonl()
@@ -124,23 +129,27 @@ class ConcealmentLoader(BasePromptLoader):
             query = self._resolve_query(queries_map, query_type)
             if query is None:
                 continue
-            system_prompt = self._build_system_prompt(conditions_map.get(condition, ""), context)
-            prompts.append({
-                "id": f"{example_id}_{condition}_{query_type}",
-                "text": query,
-                "metadata": {
-                    "system_prompt": system_prompt,
-                    "context": context,
-                    "keyword_hints": gold,
-                    "regex_monitor": regex_monitor,
-                    "example_id": example_id,
-                    "domain": domain,
-                    "condition": condition,
-                    "query_type": query_type,
-                    "control_type": control_type,
-                    "context_variant": None,
-                },
-            })
+            system_prompt = self._build_system_prompt(
+                conditions_map.get(condition, ""), context, self.format_instruction
+            )
+            prompts.append(
+                {
+                    "id": f"{example_id}_{condition}_{query_type}",
+                    "text": query,
+                    "metadata": {
+                        "system_prompt": system_prompt,
+                        "context": context,
+                        "keyword_hints": gold,
+                        "regex_monitor": regex_monitor,
+                        "example_id": example_id,
+                        "domain": domain,
+                        "condition": condition,
+                        "query_type": query_type,
+                        "control_type": control_type,
+                        "context_variant": None,
+                    },
+                }
+            )
 
         # LLM context variant prompts (regular scenarios only)
         if control_type is None:
@@ -150,36 +159,42 @@ class ConcealmentLoader(BasePromptLoader):
                     if query is None:
                         continue
                     system_prompt = self._build_system_prompt(
-                        conditions_map.get(condition, ""), variant_context
+                        conditions_map.get(condition, ""),
+                        variant_context,
+                        self.format_instruction,
                     )
-                    prompts.append({
-                        "id": f"{example_id}_cv{i}_{condition}_{query_type}",
-                        "text": query,
-                        "metadata": {
-                            "system_prompt": system_prompt,
-                            "context": variant_context,
-                            "keyword_hints": gold,
-                            "regex_monitor": regex_monitor,
-                            "example_id": example_id,
-                            "domain": domain,
-                            "condition": condition,
-                            "query_type": query_type,
-                            "control_type": control_type,
-                            "context_variant": i,
-                        },
-                    })
+                    prompts.append(
+                        {
+                            "id": f"{example_id}_cv{i}_{condition}_{query_type}",
+                            "text": query,
+                            "metadata": {
+                                "system_prompt": system_prompt,
+                                "context": variant_context,
+                                "keyword_hints": gold,
+                                "regex_monitor": regex_monitor,
+                                "example_id": example_id,
+                                "domain": domain,
+                                "condition": condition,
+                                "query_type": query_type,
+                                "control_type": control_type,
+                                "context_variant": i,
+                            },
+                        }
+                    )
 
         return prompts
 
     @staticmethod
-    def _build_system_prompt(condition: str, context: str) -> str:
-        """Combine the A-condition string with the context paragraph.
+    def _build_system_prompt(
+        condition: str, context: str, format_instruction: bool = True
+    ) -> str:
+        """Combine the context paragraph, A-condition and output-format instruction.
 
-        Context comes first (background knowledge), then the condition (role + policy).
-        This ordering ensures the policy/role instruction is closest to generation,
-        giving it recency advantage in the attention mechanism.
+        Order: context (background knowledge), condition (role + policy), then
+        the format instruction last — small models ignored it when it came first.
         """
-        return f"{context}\n\n{condition}"
+        prompt = f"{context}\n\n{condition}"
+        return f"{prompt}\n\n{FORMAT_INSTRUCTION}" if format_instruction else prompt
 
     @staticmethod
     def _resolve_query(queries_map: dict, query_type: str) -> str | None:

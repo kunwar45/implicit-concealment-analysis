@@ -1,7 +1,7 @@
 """FramingLoader — load a concealment JSONL using explicit framing conditions.
 
 Mirrors ``ConcealmentLoader`` exactly, but replaces A0/A1/A2 conditions with
-the 13 framing conditions defined in ``src.framing.conditions``.
+the framing conditions defined in ``src.framing.conditions``.
 
 Prompt dict schema
 ------------------
@@ -9,7 +9,7 @@ Prompt dict schema
                e.g. ``shipping_0003_M_inst_B1``
 ``text``     : the user query only
 ``metadata`` : {
-    ``system_prompt``      : "{framing_template}\\n\\n{context}",
+    ``system_prompt``      : "{context}\\n\\n{framing_template}\\n\\n{format}",
     ``context``            : raw context paragraph (for auditing),
     ``keyword_hints``      : gold surface forms (for KeywordMonitor),
     ``regex_monitor``      : precomputed pattern dict (for RegexMonitor),
@@ -38,6 +38,7 @@ import json
 
 from .conditions import CONDITION_ORDER, REGISTRY, render
 from src.loaders.base_loader import BasePromptLoader
+from src.steps.base_model_step import FORMAT_INSTRUCTION
 
 
 class FramingLoader(BasePromptLoader):
@@ -60,12 +61,15 @@ class FramingLoader(BasePromptLoader):
         framing_keys: list[str] | None = None,
         query_types: str = "B1",
         limit: int | None = None,
+        format_instruction: bool = True,
     ):
         self.jsonl_path = jsonl_path
         self.role = role
         self.framing_keys = framing_keys if framing_keys is not None else list(CONDITION_ORDER)
         self.query_types = [q.strip() for q in query_types.split(",") if q.strip()]
         self.limit = limit
+        # False for native reasoning models (Qwen3/3.6 thinking): they emit <think>.
+        self.format_instruction = format_instruction
 
         # Validate keys
         unknown = [k for k in self.framing_keys if k not in REGISTRY]
@@ -121,7 +125,8 @@ class FramingLoader(BasePromptLoader):
             query = self._resolve_query(queries_map, query_type)
             if query is None:
                 continue
-            system_prompt = self._build_system_prompt(framing_key, self.role, context)
+            system_prompt = self._build_system_prompt(framing_key, self.role, context,
+                                                     self.format_instruction)
             cond = REGISTRY[framing_key]
             prompts.append({
                 "id": f"{example_id}_{framing_key}_{query_type}",
@@ -152,7 +157,8 @@ class FramingLoader(BasePromptLoader):
                     query = self._resolve_query(queries_map, query_type)
                     if query is None:
                         continue
-                    system_prompt = self._build_system_prompt(framing_key, self.role, variant_context)
+                    system_prompt = self._build_system_prompt(framing_key, self.role, variant_context,
+                                                             self.format_instruction)
                     cond = REGISTRY[framing_key]
                     prompts.append({
                         "id": f"{example_id}_cv{i}_{framing_key}_{query_type}",
@@ -179,15 +185,16 @@ class FramingLoader(BasePromptLoader):
         return prompts
 
     @staticmethod
-    def _build_system_prompt(framing_key: str, role: str, context: str) -> str:
+    def _build_system_prompt(framing_key: str, role: str, context: str,
+                             format_instruction: bool = True) -> str:
         """Combine the rendered framing template with the scenario context.
 
-        Context comes first (background knowledge), framing last (role + policy).
-        Placing the instruction closest to generation gives it recency advantage,
-        making implicit framing conditions more influential.
+        Order: context (background knowledge), framing (role + policy), then the
+        output-format instruction last — small models ignored it when it came first.
         """
         condition_string = render(framing_key, role)
-        return f"{context}\n\n{condition_string}"
+        prompt = f"{context}\n\n{condition_string}"
+        return f"{prompt}\n\n{FORMAT_INSTRUCTION}" if format_instruction else prompt
 
     @staticmethod
     def _resolve_query(queries_map: dict, query_type: str) -> str | None:

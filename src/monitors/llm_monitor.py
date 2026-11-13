@@ -36,6 +36,18 @@ verdict must be exactly one of: "disclosed" | "concealed" | "redirected" | "uncl
 """
 
 
+def warn_if_same_judge(subject_model: str, judge_model: str) -> bool:
+    """Print a loud warning when the judge is the subject model; return True if so."""
+    same = subject_model == judge_model
+    if same:
+        print(
+            "\n  ⚠ WARNING: LLM judge model == subject model "
+            f"({judge_model}). Self-judging can bias labels; "
+            "pass a different --monitor-model.\n"
+        )
+    return same
+
+
 class LLMMonitor(BaseMonitor):
     def __init__(self, client: ChatClient, config: Config):
         self.client = client

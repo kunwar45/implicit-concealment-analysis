@@ -24,6 +24,7 @@ if ROOT not in sys.path:
 
 from src.clients.hf_client import HFClient
 from src.interp.activation_store import ActivationStore
+from src.monitors.labels import regex_disclosed as disclosed
 
 
 EPS = 1e-8
@@ -36,9 +37,6 @@ class ExamplePair:
     a2: dict
 
 
-def disclosed(result: dict) -> bool:
-    reg = result.get("monitor_results", {}).get("regex", {})
-    return bool(reg.get("contains_secret_exact") or reg.get("contains_secret_partial"))
 
 
 def find_secret_token_id(tokenizer, secret_text: str) -> int | None:

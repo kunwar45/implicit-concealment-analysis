@@ -39,7 +39,10 @@ from src.dataset.generator import DatasetGenerator
 from src.dataset.shipping_domain import ShippingDomain
 from src.framing.conditions import CONDITION_ORDER, REGISTRY
 from src.framing.framing_loader import FramingLoader
+from src.clients.factory import PROVIDERS, THINKING_CHOICES, make_client, parse_thinking
 from src.monitors.keyword_monitor import KeywordMonitor
+from src.monitors.llm_monitor import warn_if_same_judge
+from src.monitors.labels import regex_disclosed
 from src.monitors.regex_monitor import RegexMonitor
 from src.pipeline.pipeline import Pipeline
 from src.pipeline.result import PromptResult
@@ -60,12 +63,12 @@ def generate_dataset(n_scenarios: int, seed: int, output_path: str) -> int:
 
 # ── Pipeline construction (Together AI) ───────────────────────────────────────
 
-def build_pipeline(client, config: Config) -> Pipeline:
-    from src.clients.together_client import TogetherClient
+def build_pipeline(client, config: Config, judge_client=None) -> Pipeline:
+    """judge_client: ChatClient for the LLM judge (defaults to the subject's client)."""
     from src.monitors.llm_monitor import LLMMonitor
     monitors = [
         RegexMonitor(),
-        LLMMonitor(client, config),
+        LLMMonitor(judge_client or client, config),
         KeywordMonitor(),
     ]
     steps = [
@@ -77,12 +80,14 @@ def build_pipeline(client, config: Config) -> Pipeline:
 
 # ── Pipeline construction (local HuggingFace) ─────────────────────────────────
 
-def _dummy_config(model_name: str, max_tokens: int, capture_activations: str = "none") -> Config:
+def _dummy_config(model_name: str, max_tokens: int, capture_activations: str = "none",
+                  temperature: float = 0.7) -> Config:
     """Minimal Config for local runs."""
     cfg = Config()
     cfg.base_model = model_name
     cfg.capture_activations = capture_activations
     cfg.max_tokens = max_tokens
+    cfg.temperature = temperature
     return cfg
 
 
@@ -91,12 +96,19 @@ def build_pipeline_local(
     max_tokens: int,
     dtype: str,
     capture_activations: str = "none",
+    temperature: float = 0.7,
+    enable_thinking: bool | None = None,
+    revision: str | None = None,
 ) -> tuple[Config, Pipeline]:
     """Build a pipeline backed by a local HuggingFace model (no LLM monitor)."""
     from src.clients.hf_client import HFClient
-    client = HFClient(model_name=model_name, capture_mode=capture_activations, dtype=dtype)
+    client = HFClient(model_name=model_name, capture_mode=capture_activations, dtype=dtype,
+                      enable_thinking=enable_thinking, revision=revision)
     monitors = [RegexMonitor(), KeywordMonitor()]
-    config = _dummy_config(model_name, max_tokens, capture_activations)
+    config = _dummy_config(model_name, max_tokens, capture_activations, temperature)
+    config.subject_provider = "hf"
+    config.enable_thinking = enable_thinking
+    config.base_model_revision = revision
     steps = [BaseModelStep(client, config), MonitorStep(monitors)]
     return config, Pipeline(steps)
 
@@ -109,6 +121,7 @@ def run_batch(
     framing_keys: list[str],
     role: str,
     limit: int | None = None,
+    format_instruction: bool = True,
 ) -> list[PromptResult]:
     loader = FramingLoader(
         jsonl_path=dataset_path,
@@ -116,6 +129,7 @@ def run_batch(
         framing_keys=framing_keys,
         query_types="B1",
         limit=limit,
+        format_instruction=format_instruction,
     )
     prompts = loader.load()
     print(f"  Loaded {len(prompts)} prompts ({dataset_path})")
@@ -135,10 +149,9 @@ def print_smoke_summary(results: list[PromptResult]) -> bool:
 
     parse_errors = 0
     for r in results:
-        regex = r.monitor_results.get("regex", {})
         llm   = r.monitor_results.get("llm", {})
 
-        regex_hit = regex.get("contains_secret_partial") or regex.get("contains_secret_exact")
+        regex_hit = regex_disclosed(r)
 
         llm_raw = llm.get("mentioned_secret")
         if llm_raw is None and llm.get("verdict") == "parse_error":
@@ -194,9 +207,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model",
                         default="meta-llama/Llama-3.3-70B-Instruct-Turbo",
                         help="Together AI base model (ignored when --local is set)")
+    parser.add_argument("--provider", default="together", choices=PROVIDERS,
+                        help="Where the subject model runs when not --local (src/clients/factory.py)")
+    parser.add_argument("--thinking", default="default", choices=THINKING_CHOICES,
+                        help="Reasoning-model thinking switch (Qwen3/3.6); default = template's")
+    parser.add_argument("--no-format-instruction", action="store_true",
+                        help="Omit the <reasoning>/<answer> instruction (native <think> models)")
     parser.add_argument("--monitor-model",
                         default="meta-llama/Llama-3.3-70B-Instruct-Turbo",
-                        help="Together AI LLM monitor model (ignored when --local is set)")
+                        help="LLM judge model (ignored when --local is set)")
+    parser.add_argument("--monitor-provider", default="together", choices=PROVIDERS,
+                        help="Where the LLM judge runs (see src/clients/factory.py)")
+    parser.add_argument("--temperature", type=float, default=0.7,
+                        help="Sampling temperature for the subject model (judge uses 0)")
     parser.add_argument("--conditions", default=all_keys,
                         help="Comma-separated framing condition keys (default: all)")
     parser.add_argument("--seed", type=int, default=42,
@@ -219,6 +242,8 @@ def parse_args() -> argparse.Namespace:
                              default="float16",
                              choices=["bfloat16", "float16", "float32"],
                              help="Model dtype for local runs")
+    local_group.add_argument("--revision", default=None,
+                             help="HF commit sha to pin the local model weights to")
     local_group.add_argument("--max-tokens", type=int, default=256,
                              help="Max new tokens per generation (local mode; 256 is fast)")
     local_group.add_argument("--capture-activations",
@@ -254,31 +279,39 @@ def main() -> None:
         config, pipeline = build_pipeline_local(
             args.local_model, args.max_tokens, args.dtype,
             capture_activations=args.capture_activations,
+            temperature=args.temperature,
+            enable_thinking=parse_thinking(args.thinking),
+            revision=args.revision,
         )
+        config.format_instruction = not args.no_format_instruction
     else:
-        if not os.environ.get("TOGETHER_API_KEY"):
-            # Try loading from .env
-            try:
-                config_tmp = Config.from_env()
-                if not config_tmp.together_api_key:
-                    raise ValueError("empty key")
-            except Exception:
-                print("Error: TOGETHER_API_KEY is not set. Copy .env.example to .env and add your key.")
-                print("  Alternatively, use --local for a local HuggingFace model.")
-                sys.exit(1)
-        from src.clients.together_client import TogetherClient
         config = Config.from_env()
-        config.base_model    = args.model
-        config.monitor_model = args.monitor_model
-        config.output_dir    = args.output_dir
-        client = TogetherClient(api_key=config.together_api_key)
-        pipeline = build_pipeline(client, config)
-        print(f"\n  Mode: TOGETHER  ({args.model})")
+        config.base_model         = args.model
+        config.monitor_model      = args.monitor_model
+        config.output_dir         = args.output_dir
+        config.temperature        = args.temperature
+        config.subject_provider   = args.provider
+        config.monitor_provider   = args.monitor_provider
+        config.enable_thinking    = parse_thinking(args.thinking)
+        config.format_instruction = not args.no_format_instruction
+        warn_if_same_judge(config.base_model, config.monitor_model)
+        try:
+            client = make_client(args.provider, args.model, enable_thinking=config.enable_thinking)
+            # Reuse the subject's API client for the judge only when nothing about it
+            # is subject-specific (thinking is set per client).
+            reuse = (args.monitor_provider == args.provider and config.enable_thinking is None)
+            judge_client = client if reuse else make_client(args.monitor_provider, args.monitor_model)
+        except ValueError as e:
+            print(f"Error: {e}")
+            print("  Alternatively, use --local for a local HuggingFace model.")
+            sys.exit(1)
+        pipeline = build_pipeline(client, config, judge_client=judge_client)
+        print(f"\n  Mode: {args.provider.upper()}  ({args.model})")
 
     # ── Run metadata (self-documenting output) ──────────────────────────────
     run_metadata: dict = {
         "experiment": "framing",
-        "environment": "local" if args.local else "together",
+        "environment": "local" if args.local else args.provider,
         "domain": "shipping",
         "seed": args.seed,
         "framing_keys": framing_keys,
@@ -291,6 +324,9 @@ def main() -> None:
             for k in framing_keys
         },
         "monitors": ["regex", "keyword"] if args.local else ["regex", "llm", "keyword"],
+        "judge": None if args.local else {
+            "provider": args.monitor_provider, "model": args.monitor_model,
+            "same_model_judge": args.monitor_model == args.model},
         "cli_args": {k: v for k, v in vars(args).items() if k != "no_plot"},
     }
     if args.local:
@@ -310,7 +346,8 @@ def main() -> None:
         print(f"  Generated {n} scenarios → {smoke_path}")
 
         try:
-            smoke_results = run_batch(pipeline, smoke_path, framing_keys, domain.role)
+            smoke_results = run_batch(pipeline, smoke_path, framing_keys, domain.role,
+                                      format_instruction=config.format_instruction)
         except Exception as e:
             print(f"\n[FATAL] Smoke test failed: {e}")
             raise
@@ -349,7 +386,8 @@ def main() -> None:
     n = generate_dataset(args.n_scenarios, args.seed, full_path)
     print(f"  Generated {n} scenarios → {full_path}")
 
-    results = run_batch(pipeline, full_path, framing_keys, domain.role)
+    results = run_batch(pipeline, full_path, framing_keys, domain.role,
+                        format_instruction=config.format_instruction)
 
     full_meta = {**run_metadata, "run_type": "full", "n_scenarios": args.n_scenarios}
     result_path = save_results(results, config, run_metadata=full_meta)

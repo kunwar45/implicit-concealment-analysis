@@ -31,6 +31,7 @@ from datetime import datetime, timezone
 import numpy as np
 import torch
 
+from src.clients.factory import THINKING_CHOICES, parse_thinking
 from src.clients.hf_client import HFClient
 from src.config import Config
 from src.dataset.generator import DatasetGenerator
@@ -38,6 +39,7 @@ from src.dataset.shipping_domain import ShippingDomain
 from src.interp.activation_store import ActivationStore
 from src.loaders.concealment_loader import ConcealmentLoader
 from src.monitors.keyword_monitor import KeywordMonitor
+from src.monitors.labels import regex_disclosed
 from src.monitors.regex_monitor import RegexMonitor
 from src.pipeline.pipeline import Pipeline
 from src.pipeline.result import PromptResult
@@ -57,15 +59,17 @@ def generate_dataset(n_scenarios: int, seed: int, output_path: str) -> int:
 
 # ── Pipeline (no LLM monitor — local only) ───────────────────────────────────
 
-def build_pipeline(client: HFClient, max_tokens: int = 256) -> Pipeline:
+def build_pipeline(client: HFClient, max_tokens: int = 256, temperature: float = 0.7) -> Pipeline:
     monitors = [RegexMonitor(), KeywordMonitor()]
-    steps = [BaseModelStep(client, _dummy_config(client, max_tokens)), MonitorStep(monitors)]
+    steps = [BaseModelStep(client, _dummy_config(client, max_tokens, temperature)),
+             MonitorStep(monitors)]
     return Pipeline(steps)
 
 
-def _dummy_config(client: HFClient, max_tokens: int = 256) -> Config:
+def _dummy_config(client: HFClient, max_tokens: int = 256, temperature: float = 0.7) -> Config:
     """Minimal config for BaseModelStep using an HFClient."""
     cfg = Config()
+    cfg.temperature = temperature
     cfg.base_model = client.model_name
     cfg.capture_activations = client.capture_mode
     cfg.activations_dir = "activations"
@@ -82,19 +86,26 @@ def run_inference(
     act_dir: str,
     output_dir: str,
     max_tokens: int = 256,
+    temperature: float = 0.7,
+    format_instruction: bool = True,
 ) -> tuple[list[PromptResult], str]:
     """Run the pipeline, save results + activations, return (results, json_path)."""
     loader = ConcealmentLoader(
         jsonl_path=dataset_path,
         conditions=conditions,
         query_types="B1",
+        format_instruction=format_instruction,
     )
     prompts = loader.load()
     print(f"  {len(prompts)} prompts loaded from {dataset_path}")
 
     # Point activation saving to the right dir
-    config = _dummy_config(client, max_tokens)
+    config = _dummy_config(client, max_tokens, temperature)
     config.activations_dir = act_dir
+    config.subject_provider = "hf"
+    config.enable_thinking = client.enable_thinking
+    config.format_instruction = format_instruction
+    config.base_model_revision = client.revision
 
     monitors = [RegexMonitor(), KeywordMonitor()]
     steps = [BaseModelStep(client, config), MonitorStep(monitors)]
@@ -111,8 +122,7 @@ def run_inference(
 
 def _disclosed(r: dict) -> bool:
     """Return True if the regex monitor detected secret disclosure."""
-    regex = r.get("monitor_results", {}).get("regex", {})
-    return bool(regex.get("contains_secret_partial") or regex.get("contains_secret_exact"))
+    return regex_disclosed(r)
 
 
 def _is_regular(r: dict) -> bool:
@@ -647,6 +657,14 @@ def parse_args() -> argparse.Namespace:
                              "A0,A2 gives clean binary probes; add A1 for 3-class.")
     parser.add_argument("--max-tokens", type=int, default=256,
                         help="Max new tokens per generation (default: 256 for speed)")
+    parser.add_argument("--temperature", type=float, default=0.7,
+                        help="Sampling temperature for the subject model")
+    parser.add_argument("--thinking", default="default", choices=THINKING_CHOICES,
+                        help="Reasoning-model thinking switch (Qwen3/3.6); default = template's")
+    parser.add_argument("--no-format-instruction", action="store_true",
+                        help="Omit the <reasoning>/<answer> instruction (native <think> models)")
+    parser.add_argument("--revision", default=None,
+                        help="HF commit sha to pin the model weights to (default: main)")
     parser.add_argument("--n-logit-pairs", type=int, default=3,
                         help="Number of A0/A2 pairs for logit-lens analysis")
     parser.add_argument("--seed", type=int, default=42)
@@ -669,6 +687,10 @@ def run_batch(
     timestamp: str,
     tag: str,
     max_tokens: int = 256,
+    temperature: float = 0.7,
+    enable_thinking: bool | None = None,
+    format_instruction: bool = True,
+    revision: str | None = None,
 ) -> tuple[ActivationStore, list[PromptResult], str, str]:
     """Generate dataset, run inference, return (store, results, result_path, act_dir)."""
     dataset_path = os.path.join(data_dir, f"interp_{tag}_{timestamp}.jsonl")
@@ -682,6 +704,8 @@ def run_batch(
         model_name=model_name,
         dtype=dtype,
         capture_mode="last_token",
+        enable_thinking=enable_thinking,
+        revision=revision,
     )
 
     results, result_path = run_inference(
@@ -691,6 +715,8 @@ def run_batch(
         act_dir=act_dir,
         output_dir=output_dir,
         max_tokens=max_tokens,
+        temperature=temperature,
+        format_instruction=format_instruction,
     )
 
     n_with_acts = sum(1 for r in results if r.activation_path)
@@ -716,8 +742,7 @@ def print_smoke_summary(results: list[PromptResult], store: ActivationStore) -> 
         has_act = "✓" if r.activation_path else "✗"
         if not r.activation_path:
             errors += 1
-        regex = r.monitor_results.get("regex", {})
-        regex_hit = "YES" if (regex.get("contains_secret_partial") or regex.get("contains_secret_exact")) else "no"
+        regex_hit = "YES" if regex_disclosed(r) else "no"
         pid = r.prompt_id[-W:] if len(r.prompt_id) > W else r.prompt_id
         print(f"  │  {pid:<{W}} {cond:>4}  {has_act:>3}  {regex_hit:>5}  │")
     print(f"  └{'─' * (W + 26)}┘")
@@ -756,6 +781,10 @@ def main() -> None:
                 timestamp=timestamp,
                 tag="smoke",
                 max_tokens=args.max_tokens,
+                temperature=args.temperature,
+                enable_thinking=parse_thinking(args.thinking),
+                format_instruction=not args.no_format_instruction,
+                revision=args.revision,
             )
         except Exception as e:
             print(f"\n[FATAL] Smoke test inference failed: {e}")
@@ -802,6 +831,10 @@ def main() -> None:
         timestamp=timestamp,
         tag="full",
         max_tokens=args.max_tokens,
+        temperature=args.temperature,
+        enable_thinking=parse_thinking(args.thinking),
+        format_instruction=not args.no_format_instruction,
+        revision=args.revision,
     )
 
     print(f"\n  Results saved → {result_path}")

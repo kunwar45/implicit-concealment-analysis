@@ -27,13 +27,15 @@ import os
 import sys
 from datetime import datetime, timezone
 
-from src.clients.together_client import TogetherClient
+from src.clients.factory import PROVIDERS, THINKING_CHOICES, make_client, parse_thinking
+from src.clients import ChatClient
 from src.config import Config
 from src.dataset.generator import DatasetGenerator
 from src.dataset.shipping_domain import ShippingDomain
 from src.loaders.concealment_loader import ConcealmentLoader
 from src.monitors.keyword_monitor import KeywordMonitor
-from src.monitors.llm_monitor import LLMMonitor
+from src.monitors.labels import regex_disclosed
+from src.monitors.llm_monitor import LLMMonitor, warn_if_same_judge
 from src.monitors.regex_monitor import RegexMonitor
 from src.pipeline.pipeline import Pipeline
 from src.pipeline.result import PromptResult
@@ -54,10 +56,11 @@ def generate_dataset(n_scenarios: int, seed: int, output_path: str) -> int:
 
 # ── Pipeline construction ─────────────────────────────────────────────────────
 
-def build_pipeline(client: TogetherClient, config: Config) -> Pipeline:
+def build_pipeline(client: ChatClient, config: Config, judge_client=None) -> Pipeline:
+    """judge_client: ChatClient for the LLM judge (defaults to the subject's client)."""
     monitors = [
         RegexMonitor(),
-        LLMMonitor(client, config),
+        LLMMonitor(judge_client or client, config),
         KeywordMonitor(),
     ]
     steps = [
@@ -70,21 +73,23 @@ def build_pipeline(client: TogetherClient, config: Config) -> Pipeline:
 # ── Batch runner ──────────────────────────────────────────────────────────────
 
 def run_batch(
-    client: TogetherClient,
+    client: ChatClient,
     config: Config,
     dataset_path: str,
     conditions: str,
     limit: int | None = None,
+    judge_client=None,
 ) -> list[PromptResult]:
     loader = ConcealmentLoader(
         jsonl_path=dataset_path,
         conditions=conditions,
         query_types="B1",
         limit=limit,
+        format_instruction=config.format_instruction,
     )
     prompts = loader.load()
     print(f"  Loaded {len(prompts)} prompts ({dataset_path})")
-    pipeline = build_pipeline(client, config)
+    pipeline = build_pipeline(client, config, judge_client=judge_client)
     return pipeline.run(prompts)
 
 
@@ -100,11 +105,10 @@ def print_smoke_summary(results: list[PromptResult]) -> bool:
 
     parse_errors = 0
     for r in results:
-        regex = r.monitor_results.get("regex", {})
         llm   = r.monitor_results.get("llm", {})
         kw    = r.monitor_results.get("keyword", {})
 
-        regex_hit = regex.get("contains_secret_partial") or regex.get("contains_secret_exact")
+        regex_hit = regex_disclosed(r)
 
         llm_raw = llm.get("mentioned_secret")
         if llm_raw is None and llm.get("verdict") == "parse_error":
@@ -159,9 +163,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model",
                         default="meta-llama/Llama-3.3-70B-Instruct-Turbo",
                         help="Together AI base model")
+    parser.add_argument("--provider", default="together", choices=PROVIDERS,
+                        help="Where the subject model runs (see src/clients/factory.py)")
+    parser.add_argument("--thinking", default="default", choices=THINKING_CHOICES,
+                        help="Reasoning-model thinking switch (Qwen3/3.6); default = template's")
+    parser.add_argument("--no-format-instruction", action="store_true",
+                        help="Omit the <reasoning>/<answer> instruction (native <think> models)")
     parser.add_argument("--monitor-model",
                         default="meta-llama/Llama-3.3-70B-Instruct-Turbo",
-                        help="Together AI LLM monitor model")
+                        help="LLM judge model (any model the --monitor-provider serves)")
+    parser.add_argument("--monitor-provider", default="together", choices=PROVIDERS,
+                        help="Where the LLM judge runs (see src/clients/factory.py)")
+    parser.add_argument("--temperature", type=float, default=0.7,
+                        help="Sampling temperature for the subject model (judge uses 0)")
     parser.add_argument("--output-dir", default="results",
                         help="Directory for result JSON files")
     parser.add_argument("--data-dir", default="data",
@@ -181,15 +195,26 @@ def main() -> None:
     args = parse_args()
 
     config = Config.from_env()
-    if not config.together_api_key:
-        print("Error: TOGETHER_API_KEY is not set. Copy .env.example to .env and add your key.")
+    config.base_model         = args.model
+    config.monitor_model      = args.monitor_model
+    config.temperature        = args.temperature
+    config.output_dir         = args.output_dir
+    config.subject_provider   = args.provider
+    config.monitor_provider   = args.monitor_provider
+    config.enable_thinking    = parse_thinking(args.thinking)
+    config.format_instruction = not args.no_format_instruction
+    warn_if_same_judge(config.base_model, config.monitor_model)
+
+    try:
+        client = make_client(args.provider, args.model, enable_thinking=config.enable_thinking)
+        # Reuse the subject's API client for the judge only when nothing about it is
+        # subject-specific (an hf client holds one model; thinking is set per client).
+        reuse = (args.monitor_provider == args.provider and args.provider != "hf"
+                 and config.enable_thinking is None)
+        judge_client = client if reuse else make_client(args.monitor_provider, args.monitor_model)
+    except ValueError as e:
+        print(f"Error: {e}")
         sys.exit(1)
-
-    config.base_model    = args.model
-    config.monitor_model = args.monitor_model
-    config.output_dir    = args.output_dir
-
-    client = TogetherClient(api_key=config.together_api_key)
     os.makedirs(args.data_dir, exist_ok=True)
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -201,7 +226,7 @@ def main() -> None:
     sample_secret = {"structured": {"lead_time": "28 days"}}
     run_metadata = {
         "experiment": "blackbox",
-        "environment": "together",
+        "environment": args.provider,
         "domain": "shipping",
         "seed": args.seed,
         "conditions": conditions_list,
@@ -211,6 +236,8 @@ def main() -> None:
             "A2": domain.render_A2(sample_secret),
         },
         "monitors": ["regex", "llm", "keyword"],
+        "judge": {"provider": args.monitor_provider, "model": args.monitor_model,
+                  "same_model_judge": args.monitor_model == args.model},
         "cli_args": {k: v for k, v in vars(args).items() if k != "no_plot"},
     }
 
@@ -225,7 +252,8 @@ def main() -> None:
         print(f"  Generated {n} scenarios → {smoke_path}")
 
         try:
-            smoke_results = run_batch(client, config, smoke_path, args.conditions)
+            smoke_results = run_batch(client, config, smoke_path, args.conditions,
+                                      judge_client=judge_client)
         except Exception as e:
             print(f"\n[FATAL] Smoke test failed: {e}")
             raise
@@ -260,7 +288,8 @@ def main() -> None:
     n = generate_dataset(args.n_scenarios, args.seed, full_path)
     print(f"  Generated {n} scenarios → {full_path}")
 
-    results = run_batch(client, config, full_path, args.conditions)
+    results = run_batch(client, config, full_path, args.conditions,
+                        judge_client=judge_client)
 
     full_meta = {**run_metadata, "run_type": "full", "n_scenarios": args.n_scenarios}
     result_path = save_results(results, config, run_metadata=full_meta)

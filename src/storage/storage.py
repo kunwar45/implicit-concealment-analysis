@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import uuid
@@ -13,6 +14,15 @@ class ResultStorage:
     def __init__(self, config: Config):
         self.config = config
         os.makedirs(config.output_dir, exist_ok=True)
+
+    # Fields never written to disk (results are pushed to a public HF repo).
+    _SECRET_FIELDS = ("together_api_key",)
+
+    def _config_dict(self) -> dict:
+        cfg = dataclasses.asdict(self.config)
+        for key in self._SECRET_FIELDS:
+            cfg.pop(key, None)
+        return cfg
 
     def save(
         self,
@@ -29,10 +39,7 @@ class ResultStorage:
         payload = {
             "run_id": run_id,
             "run_timestamp": now.isoformat(),
-            "config": {
-                "base_model": self.config.base_model,
-                "monitor_model": self.config.monitor_model,
-            },
+            "config": self._config_dict(),
             "results": [r.to_dict() for r in results],
         }
         if run_metadata:

@@ -40,9 +40,16 @@ class HFClient:
         model_name: str,
         dtype: str = "bfloat16",
         capture_mode: str = "none",
+        enable_thinking: bool | None = None,
+        revision: str | None = None,
     ):
         self.model_name = model_name
+        # Pin the exact weights (a commit sha); None = the repo's main branch.
+        self.revision = revision
         self.capture_mode = capture_mode
+        # Reasoning models (Qwen3/3.6): True/False sets the chat template's thinking
+        # switch; None keeps the template default. Ignored by templates without it.
+        self.enable_thinking = enable_thinking
         self.device = detect_device()
 
         dtype_map = {
@@ -57,12 +64,13 @@ class HFClient:
             print("MPS detected: downgrading bfloat16 → float16 for compatibility")
             torch_dtype = torch.float16
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, revision=revision)
 
         if self.device == "cuda":
             # device_map="auto" handles multi-GPU and CPU offload on CUDA
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_name,
+                revision=revision,
                 dtype=torch_dtype,
                 device_map="auto",
             )
@@ -70,6 +78,7 @@ class HFClient:
             # MPS and CPU: load on CPU first, then move (device_map="auto" doesn't support MPS)
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_name,
+                revision=revision,
                 dtype=torch_dtype,
             )
             self.model = self.model.to(self.device)
@@ -199,8 +208,11 @@ class HFClient:
     def _apply_chat_template(self, messages: list[dict]) -> str:
         """Apply the tokenizer chat template if available, else fall back to manual format."""
         if self.tokenizer.chat_template is not None:
+            kwargs = {}
+            if self.enable_thinking is not None:
+                kwargs["enable_thinking"] = self.enable_thinking
             return self.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
+                messages, tokenize=False, add_generation_prompt=True, **kwargs
             )
         # Fallback: simple concatenation
         parts = []

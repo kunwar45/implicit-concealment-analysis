@@ -47,9 +47,12 @@ def _subtitle(payload: dict, results: list[dict]) -> str:
     return f"({model_short}, {n_scenarios} scenarios, n={n_regular} regular prompts)"
 
 
-def _regex_disclosed(r: dict) -> bool:
-    regex = r.get("monitor_results", {}).get("regex", {})
-    return bool(regex.get("contains_secret_exact") or regex.get("contains_secret_partial"))
+try:  # single source of truth for the disclosure label
+    from src.monitors.labels import regex_disclosed as _regex_disclosed
+except ImportError:  # direct invocation without repo root on sys.path
+    def _regex_disclosed(r: dict) -> bool:
+        regex = r.get("monitor_results", {}).get("regex", {})
+        return bool(regex.get("contains_secret_exact") or regex.get("contains_secret_partial"))
 
 
 def _llm_disclosed(r: dict) -> bool | None:

@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import json
 
-from .conditions import CONDITION_ORDER, REGISTRY, render
+from .conditions import ALL_CONDITIONS as REGISTRY, CONDITION_ORDER, render  # retired keys still runnable
 from src.loaders.base_loader import BasePromptLoader
 from src.steps.base_model_step import FORMAT_INSTRUCTION
 
@@ -147,6 +147,8 @@ class FramingLoader(BasePromptLoader):
                     "framing_label": cond.label,
                     "framing_template": cond.template,
                     "secret_structured": secret_structured,
+                    "ladder_meta": (queries_map.get("ladder_meta")
+                                    if query_type.startswith("R") else None),
                 },
             })
 
@@ -199,7 +201,7 @@ class FramingLoader(BasePromptLoader):
     @staticmethod
     def _resolve_query(queries_map: dict, query_type: str) -> str | None:
         """Resolve query_type string to actual query text (mirrors ConcealmentLoader)."""
-        if query_type in ("B0", "B1"):
+        if query_type in ("B0", "B1", "R1", "R2", "R3"):
             return queries_map.get(query_type)
 
         if query_type.startswith("B1_llm_p"):

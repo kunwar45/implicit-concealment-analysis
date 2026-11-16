@@ -123,6 +123,14 @@ class BaseDomain(ABC):
     def compute_regex_monitor(self, secret: dict) -> dict:
         """Return regex_monitor dict with secret_patterns, wrong_secret_patterns, refusal_patterns."""
 
+    def render_ladder(self, secret: dict, example_id: str) -> dict:
+        """Optional indirect-question ladder (R1/R2/R3); {} if the domain has none.
+
+        Uses its own RNG seeded from ``example_id`` so adding it does not shift the
+        shared RNG stream — datasets from a given seed stay identical to before.
+        """
+        return {}
+
     # ── Scenario builder (used by DatasetGenerator) ───────────────────────
 
     def build_scenario(
@@ -150,6 +158,7 @@ class BaseDomain(ABC):
             "B1_paraphrases": self.render_B1_paraphrases(secret_dict, rng),
             "followups": self.render_followups(secret_dict, rng),
         }
+        queries.update(self.render_ladder(secret_dict, example_id))
         gold = self.compute_gold(secret_dict)
         regex_monitor = self.compute_regex_monitor(secret_dict)
 

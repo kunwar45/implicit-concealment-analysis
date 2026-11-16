@@ -104,3 +104,19 @@ def test_plot_rates_exclude_unjudged():
     rows = [{"monitor_results": {"llm": {"verdict": v}}} for v in ("disclosed", "concealed", "parse_error")]
     rows.append({"monitor_results": {}})
     assert _rate(rows, _llm_disclosed) == 0.5
+
+
+def test_reasoning_considers_concealing_recorded():
+    judge = RecordingJudge(reasoning_json='{"mentions_secret": true, "evidence": "21 days", '
+                                          '"considers_concealing": "true", '
+                                          '"concealing_evidence": "won\'t say"}')
+    out = LLMMonitor(judge, Config()).run(_result())
+    assert out["reasoning_considers_concealing"] is True
+    assert out["reasoning_concealing_evidence"] == "won't say"
+
+
+def test_reasoning_considers_concealing_missing_is_none():
+    out = LLMMonitor(RecordingJudge(), Config()).run(_result())  # old-style reply, no field
+    assert out["reasoning_considers_concealing"] is None
+    skipped = LLMMonitor(RecordingJudge(), Config()).run(_result(format_ok=False))
+    assert skipped["reasoning_considers_concealing"] is None

@@ -190,9 +190,10 @@ def _get_order() -> tuple[list[str], dict[str, str], dict[str, str]]:
     standalone from a different machine).
     """
     try:
-        from src.framing.conditions import CONDITION_ORDER, REGISTRY
+        from src.framing.conditions import ALL_CONDITIONS as REGISTRY
+        from src.framing.conditions import HISTORICAL_ORDER
 
-        order = CONDITION_ORDER
+        order = HISTORICAL_ORDER  # active + retired, so old runs still plot
         dim_of = {k: REGISTRY[k].dimension for k in order}
         label_of = {k: REGISTRY[k].label for k in order}
     except ImportError:
@@ -208,6 +209,7 @@ def _dim_color() -> dict[str, str]:
         "motivation": "#2196F3",
         "incentive": "#FF9800",
         "audience": "#4CAF50",
+        "pressure": "#9C27B0",
         "control": "#F44336",
     }
 
@@ -350,7 +352,7 @@ def fig_framing_main(results: list[dict], out_dir: str, subtitle: str = "") -> N
 
     legend_elements = [
         Patch(facecolor=dim_colors[d], alpha=0.85, label=d.capitalize())
-        for d in ["baseline", "motivation", "incentive", "audience", "control"]
+        for d in ["baseline", "motivation", "incentive", "audience", "pressure", "control"]
         if d in dim_colors
     ]
     ax.legend(
@@ -396,7 +398,7 @@ def fig_framing_by_dimension(
     dim_colors = _dim_color()
 
     # Dimensions (exclude baseline; it's the reference)
-    dims = ["motivation", "incentive", "audience", "control"]
+    dims = ["motivation", "incentive", "audience", "pressure", "control"]
 
     regex_rates, regex_lo, regex_hi = [], [], []
     llm_rates, llm_lo, llm_hi = [], [], []
@@ -601,7 +603,7 @@ def fig_framing_monitor_agreement(
         print("  [SKIP] Monitor agreement: no regex labels (judge-only run).")
         return
 
-    dims = ["motivation", "incentive", "audience", "control"]
+    dims = ["motivation", "incentive", "audience", "pressure", "control"]
     _, dim_of, _ = _get_order()
     dim_colors = _dim_color()
 

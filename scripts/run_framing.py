@@ -37,7 +37,7 @@ from datetime import datetime, timezone
 from src.config import Config
 from src.dataset.generator import DatasetGenerator
 from src.dataset.shipping_domain import ShippingDomain
-from src.framing.conditions import CONDITION_ORDER, REGISTRY
+from src.framing.conditions import ALL_CONDITIONS as REGISTRY, CONDITION_ORDER  # retired keys runnable
 from src.framing.framing_loader import FramingLoader
 from src.clients.factory import PROVIDERS, THINKING_CHOICES, make_client, parse_thinking
 from src.monitors.llm_monitor import warn_if_same_judge
@@ -60,10 +60,12 @@ def generate_dataset(n_scenarios: int, seed: int, output_path: str) -> int:
 
 # ── Pipeline construction (Together AI) ───────────────────────────────────────
 
-def build_pipeline(client, config: Config, judge_client=None) -> Pipeline:
+def build_pipeline(client, config: Config, judge_client=None, judge: bool = True) -> Pipeline:
     """judge_client: ChatClient for the LLM judge (defaults to the subject's client)."""
     from src.monitors.llm_monitor import LLMMonitor
-    monitors = [LLMMonitor(judge_client or client, config)]  # judge is the only label
+    # The judge is the only label; judge=False saves the run unjudged for
+    # `python -m scripts.judge_results` later (e.g. no judge API key yet).
+    monitors = [LLMMonitor(judge_client or client, config)] if judge else []
     steps = [
         BaseModelStep(client, config),
         MonitorStep(monitors),
@@ -115,18 +117,20 @@ def run_batch(
     role: str,
     limit: int | None = None,
     format_instruction: bool = True,
+    workers: int = 1,
+    query_types: str = "B1",
 ) -> list[PromptResult]:
     loader = FramingLoader(
         jsonl_path=dataset_path,
         role=role,
         framing_keys=framing_keys,
-        query_types="B1",
+        query_types=query_types,
         limit=limit,
         format_instruction=format_instruction,
     )
     prompts = loader.load()
     print(f"  Loaded {len(prompts)} prompts ({dataset_path})")
-    return pipeline.run(prompts)
+    return pipeline.run(prompts, workers=workers)
 
 
 # ── Smoke test summary ─────────────────────────────────────────────────────────
@@ -213,6 +217,16 @@ def parse_args() -> argparse.Namespace:
                         help="LLM judge model (ignored when --local is set)")
     parser.add_argument("--monitor-provider", default="together", choices=PROVIDERS,
                         help="Where the LLM judge runs (see src/clients/factory.py)")
+    parser.add_argument("--query-types", default="B1",
+                        help="Comma-separated customer questions: B1 = direct timing question; "
+                             "R1/R2/R3 = indirect ladder (deadline / anything to know / confirm)")
+    parser.add_argument("--no-judge", action="store_true",
+                        help="Save the run unjudged; judge later with scripts.judge_results")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Concurrent requests (API/vLLM providers only; local is always 1)")
+    parser.add_argument("--max-tokens", type=int, default=None,
+                        help="Max new tokens per generation (default: 256 local, "
+                             "Config.max_tokens otherwise; thinking models need thousands)")
     parser.add_argument("--temperature", type=float, default=0.7,
                         help="Sampling temperature for the subject model (judge uses 0)")
     parser.add_argument("--conditions", default=all_keys,
@@ -239,8 +253,6 @@ def parse_args() -> argparse.Namespace:
                              help="Model dtype for local runs")
     local_group.add_argument("--revision", default=None,
                              help="HF commit sha to pin the local model weights to")
-    local_group.add_argument("--max-tokens", type=int, default=256,
-                             help="Max new tokens per generation (local mode; 256 is fast)")
     local_group.add_argument("--capture-activations",
                              default="none",
                              choices=["none", "last_token", "full_sequence"],
@@ -270,6 +282,11 @@ def main() -> None:
 
     # ── Build pipeline ─────────────────────────────────────────────────────────
     if args.local:
+        if args.max_tokens is None:
+            args.max_tokens = 256
+        if args.workers != 1:
+            print("  --workers ignored in --local mode (HFClient is not thread-safe)")
+            args.workers = 1
         print(f"\n  Mode: LOCAL  ({args.local_model}  dtype={args.dtype})")
         config, pipeline = build_pipeline_local(
             args.local_model, args.max_tokens, args.dtype,
@@ -289,18 +306,25 @@ def main() -> None:
         config.monitor_provider   = args.monitor_provider
         config.enable_thinking    = parse_thinking(args.thinking)
         config.format_instruction = not args.no_format_instruction
+        config.base_model_revision = args.revision  # recorded only; the server pins weights
+        if args.max_tokens is not None:
+            config.max_tokens = args.max_tokens
+        args.max_tokens = config.max_tokens
         warn_if_same_judge(config.base_model, config.monitor_model)
         try:
             client = make_client(args.provider, args.model, enable_thinking=config.enable_thinking)
             # Reuse the subject's API client for the judge only when nothing about it
             # is subject-specific (thinking is set per client).
             reuse = (args.monitor_provider == args.provider and config.enable_thinking is None)
-            judge_client = client if reuse else make_client(args.monitor_provider, args.monitor_model)
+            judge_client = None
+            if not args.no_judge:
+                judge_client = client if reuse else make_client(args.monitor_provider, args.monitor_model)
         except ValueError as e:
             print(f"Error: {e}")
             print("  Alternatively, use --local for a local HuggingFace model.")
             sys.exit(1)
-        pipeline = build_pipeline(client, config, judge_client=judge_client)
+        pipeline = build_pipeline(client, config, judge_client=judge_client,
+                                  judge=not args.no_judge)
         print(f"\n  Mode: {args.provider.upper()}  ({args.model})")
 
     # ── Run metadata (self-documenting output) ──────────────────────────────
@@ -318,8 +342,8 @@ def main() -> None:
             }
             for k in framing_keys
         },
-        "monitors": [] if args.local else ["llm"],
-        "judge": None if args.local else {
+        "monitors": [] if (args.local or args.no_judge) else ["llm"],
+        "judge": None if (args.local or args.no_judge) else {
             "provider": args.monitor_provider, "model": args.monitor_model,
             "same_model_judge": args.monitor_model == args.model},
         "cli_args": {k: v for k, v in vars(args).items() if k != "no_plot"},
@@ -327,8 +351,11 @@ def main() -> None:
     if args.local:
         run_metadata["local_model"] = args.local_model
         run_metadata["dtype"] = args.dtype
-        run_metadata["max_tokens"] = args.max_tokens
         run_metadata["capture_activations"] = args.capture_activations
+
+    run_metadata["max_tokens"] = args.max_tokens
+    run_metadata["temperature"] = args.temperature
+    run_metadata["enable_thinking"] = parse_thinking(args.thinking)
 
     # ── Smoke test ─────────────────────────────────────────────────────────────
     if not args.skip_smoke:
@@ -342,7 +369,8 @@ def main() -> None:
 
         try:
             smoke_results = run_batch(pipeline, smoke_path, framing_keys, domain.role,
-                                      format_instruction=config.format_instruction)
+                                      format_instruction=config.format_instruction, workers=args.workers,
+                                      query_types=args.query_types)
         except Exception as e:
             print(f"\n[FATAL] Smoke test failed: {e}")
             raise
@@ -382,7 +410,8 @@ def main() -> None:
     print(f"  Generated {n} scenarios → {full_path}")
 
     results = run_batch(pipeline, full_path, framing_keys, domain.role,
-                        format_instruction=config.format_instruction)
+                        format_instruction=config.format_instruction, workers=args.workers,
+                        query_types=args.query_types)
 
     full_meta = {**run_metadata, "run_type": "full", "n_scenarios": args.n_scenarios}
     result_path = save_results(results, config, run_metadata=full_meta)

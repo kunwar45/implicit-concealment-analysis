@@ -134,8 +134,12 @@ def agent_turn(client, model: str, messages: list, scenario: dict, extra: dict,
         messages.append({"role": "assistant", "content": msg.content or "",
                          "tool_calls": [c.model_dump() for c in calls]})
         for c in calls:
-            out = tool_result(c.function.name, scenario)
-            events.append({"step": step, "type": "tool_call", "name": c.function.name,
+            # gpt-oss sometimes leaks harmony markers into the tool name
+            # ("check_stock<|channel|>commentary"); keep the part before them.
+            name = c.function.name.split("<|")[0].strip()
+            out = tool_result(name, scenario)
+            events.append({"step": step, "type": "tool_call", "name": name,
+                           "raw_name": c.function.name,
                            "arguments": c.function.arguments, "result": out})
             messages.append({"role": "tool", "tool_call_id": c.id, "content": json.dumps(out)})
     return {"texts": texts, "reasoning": reasoning_parts, "events": events,
@@ -216,23 +220,27 @@ NEXT_CUSTOMER = "[New customer chat]\nCustomer: {msg}"
 
 def run_chain(client, model: str, chain_id: str, scenarios: list[dict], framing: str,
               variant: str, enable_thinking: bool | None, max_tokens: int,
-              max_steps: int, temperature: float) -> list[PromptResult]:
+              max_steps: int, temperature: float,
+              feedback: str = "abandoned") -> list[PromptResult]:
+    """feedback="none" is the control: same customers, no dashboard notice."""
     system = f"{render(framing, ROLE)}\n\n{WORKFLOW}"
     messages = [{"role": "system", "content": system}]
+    tag = "" if feedback == "abandoned" else f"_{feedback}fb"
     rows = []
     for i, sc in enumerate(scenarios):
         lm = sc["queries"]["ladder_meta"]
         cust = USER_VARIANTS[variant].format(r1=sc["queries"]["R1"], item=lm["item"])
         user = NEXT_CUSTOMER.format(msg=cust)
-        if i > 0:
+        if i > 0 and feedback == "abandoned":
             user = DASHBOARD.format(i=i) + "\n\n" + user
         messages.append({"role": "user", "content": user})
         turn = agent_turn(client, model, messages, sc, _extra(enable_thinking),
                           max_tokens, max_steps, temperature)
-        rows.append(make_row(f"{chain_id}_{framing}_{variant}_t{i}", user, system, model,
+        rows.append(make_row(f"{chain_id}_{framing}_{variant}{tag}_t{i}", user, system, model,
                              sc, framing, variant, turn,
                              {"chain_id": chain_id, "turn": i,
-                              "abandoned_so_far": i}))
+                              "abandoned_so_far": i if feedback == "abandoned" else 0,
+                              "feedback": feedback}))
     return rows
 
 
@@ -259,6 +267,8 @@ def main() -> None:
     ap.add_argument("--temperature", type=float, default=0.7)
     ap.add_argument("--output-dir", default="results/agentic")
     ap.add_argument("--data-dir", default="data/agentic")
+    ap.add_argument("--feedback", choices=["abandoned", "none"], default="abandoned",
+                    help="escalation: 'none' = control chains without the dashboard notice")
     ap.add_argument("--resume", default=None,
                     help="escalation only: partial_*.jsonl from a crashed run; finished "
                          "chains are kept and only the missing ones are run (same --seed/"
@@ -316,7 +326,7 @@ def main() -> None:
         with ThreadPoolExecutor(max_workers=args.workers) as pool, open(ckpt, "a") as fh:
             futs = [pool.submit(run_chain, client, args.model, f"chain{c:02d}", chains[c],
                                 f, v, thinking, args.max_tokens, args.max_steps,
-                                args.temperature) for c, f, v in jobs]
+                                args.temperature, args.feedback) for c, f, v in jobs]
             for fut in tqdm(as_completed(futs), total=len(futs), desc="chains"):
                 try:
                     rows = fut.result()
@@ -352,7 +362,8 @@ def main() -> None:
     meta = {
         "experiment": "agentic_escalation" if args.escalate else "agentic",
         "escalate": args.escalate,
-        "dashboard_template": DASHBOARD if args.escalate else None,
+        "dashboard_template": DASHBOARD if args.escalate and args.feedback == "abandoned" else None,
+        "feedback": args.feedback if args.escalate else None,
         "run_type": "smoke",
         "dataset": data_path,
         "n_scenarios": args.n_scenarios,

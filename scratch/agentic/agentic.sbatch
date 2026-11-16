@@ -19,8 +19,11 @@ source ~/scratch/obf_venv/bin/activate
 cd ~/scratch/obfuscation-prompting
 export HF_HOME=~/scratch/hf_cache HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONUNBUFFERED=1
 
-MODEL=Qwen/Qwen3.6-27B
-REV=8f33b98937c6031bb49e713dee3e8e185aafd26f
+MODEL=${MODEL:-Qwen/Qwen3.6-27B}
+REV=${REV:-}; [ "$MODEL" = Qwen/Qwen3.6-27B ] && REV=${REV:-8f33b98937c6031bb49e713dee3e8e185aafd26f}
+REV_ARG=(); [ -n "$REV" ] && REV_ARG=(--revision "$REV")
+# gpt-oss: RPARSER=openai_gptoss TPARSER=openai THINKING=default
+RPARSER=${RPARSER:-qwen3}; TPARSER=${TPARSER:-qwen3_coder}; CTX=${CTX:-49152}
 JUDGE=${JUDGE:-Qwen/Qwen2.5-32B-Instruct}
 # thinking ON only: Kunwar never wants thinking-off runs
 N=${N:-8}; THINKING=${THINKING:-on}; WORKERS=${WORKERS:-32}
@@ -36,9 +39,9 @@ wait_ready() {  # $1 pid, $2 log, $3 model id that must be served
   echo "server NOT ready"; return 1
 }
 
-vllm serve "$MODEL" --revision "$REV" --port $PORT --dtype bfloat16 --max-model-len 32768 \
-  --gpu-memory-utilization 0.90 --reasoning-parser qwen3 --enable-auto-tool-choice \
-  --tool-call-parser qwen3_coder --enforce-eager --max-num-seqs $WORKERS \
+vllm serve "$MODEL" "${REV_ARG[@]}" --port $PORT --dtype bfloat16 --max-model-len $CTX \
+  --gpu-memory-utilization 0.90 --reasoning-parser "$RPARSER" --enable-auto-tool-choice \
+  --tool-call-parser "$TPARSER" --enforce-eager --max-num-seqs $WORKERS \
   > vllm-agentic-$SLURM_JOB_ID.log 2>&1 &
 PID=$!
 wait_ready $PID vllm-agentic-$SLURM_JOB_ID.log "$MODEL" || exit 1
@@ -47,7 +50,7 @@ export VLLM_BASE_URL=http://localhost:$PORT/v1
 STAMP=$(date +%s)
 for TH in $THINKING; do
   echo "### agent: thinking=$TH"
-  python -m scratch.agentic.run_agentic --model "$MODEL" --revision "$REV" --thinking "$TH" \
+  python -m scratch.agentic.run_agentic --model "$MODEL" "${REV_ARG[@]}" --thinking "$TH" \
     --n-scenarios "$N" --workers "$WORKERS" --output-dir "$OUT" --data-dir data/agentic $AGENT_ARGS
 done
 kill $PID; wait $PID 2>/dev/null; sleep 5
